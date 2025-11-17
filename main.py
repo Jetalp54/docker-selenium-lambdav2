@@ -351,37 +351,39 @@ def get_chrome_driver():
             raise Exception(f"Chrome driver initialization failed: {e2}. Chrome: {chrome_binary}, ChromeDriver: {chromedriver_path}")
 
 
-def wait_for_xpath(driver, xpath, timeout=20):
-    """Wait for element by XPath to be present."""
+def wait_for_xpath(driver, xpath, timeout=30):
+    """Wait for element by XPath to be present. Increased timeout for Lambda stability."""
     return WebDriverWait(driver, timeout).until(
         EC.presence_of_element_located((By.XPATH, xpath))
     )
 
 
-def wait_for_clickable_xpath(driver, xpath, timeout=20):
-    """Wait for element by XPath to be clickable."""
+def wait_for_clickable_xpath(driver, xpath, timeout=30):
+    """Wait for element by XPath to be clickable. Increased timeout for Lambda stability."""
     return WebDriverWait(driver, timeout).until(
         EC.element_to_be_clickable((By.XPATH, xpath))
     )
 
 
-def click_xpath(driver, xpath, timeout=20, use_js=True):
-    """Click element by XPath, with JavaScript fallback."""
+def click_xpath(driver, xpath, timeout=30, use_js=True):
+    """Click element by XPath, with JavaScript fallback. Increased timeout for Lambda stability."""
     try:
         el = wait_for_clickable_xpath(driver, xpath, timeout)
         if use_js:
             driver.execute_script("arguments[0].scrollIntoView(true);", el)
+            time.sleep(0.5)  # Brief pause for scroll
             driver.execute_script("arguments[0].click();", el)
         else:
             el.click()
+        time.sleep(1)  # Brief pause after click for page to respond
         return el
     except Exception as e:
         logger.warning(f"Failed to click {xpath}: {e}")
         raise
 
 
-def element_exists(driver, xpath, timeout=5):
-    """Check if element exists without raising exception."""
+def element_exists(driver, xpath, timeout=10):
+    """Check if element exists without raising exception. Increased timeout for Lambda stability."""
     try:
         WebDriverWait(driver, timeout).until(
             EC.presence_of_element_located((By.XPATH, xpath))
@@ -391,9 +393,9 @@ def element_exists(driver, xpath, timeout=5):
         return False
 
 
-def find_element_with_fallback(driver, xpath_list, timeout=10, description="element"):
-    """Try multiple XPath variations to find an element."""
-    per_xpath_timeout = max(1, timeout // len(xpath_list)) if len(xpath_list) > 1 else timeout
+def find_element_with_fallback(driver, xpath_list, timeout=20, description="element"):
+    """Try multiple XPath variations to find an element. Increased timeout for Lambda stability."""
+    per_xpath_timeout = max(2, timeout // len(xpath_list)) if len(xpath_list) > 1 else timeout
     
     for i, xpath in enumerate(xpath_list):
         try:
@@ -605,10 +607,10 @@ def login_google(driver, email, password, known_totp_secret=None):
     
     # Navigate with timeout and error handling
     try:
-        driver.set_page_load_timeout(30)
+        driver.set_page_load_timeout(60)  # Increased for Lambda
         driver.get("https://accounts.google.com/signin/v2/identifier?hl=en&flowName=GlifWebSignIn")
         logger.info("[STEP] Navigation to Google login page completed")
-        time.sleep(2)
+        time.sleep(3)  # Increased wait for page to fully load
     except Exception as nav_error:
         logger.error(f"[STEP] Navigation failed: {nav_error}")
         # Check if driver is still alive
@@ -620,10 +622,12 @@ def login_google(driver, email, password, known_totp_secret=None):
 
     try:
         # Enter email
-        email_input = wait_for_xpath(driver, "//input[@id='identifierId']", timeout=20)
+        email_input = wait_for_xpath(driver, "//input[@id='identifierId']", timeout=30)
         email_input.clear()
+        time.sleep(0.5)
         email_input.send_keys(email)
         logger.info("[STEP] Email entered")
+        time.sleep(1)
         
         # Click Next button
         email_next_xpaths = [
@@ -631,16 +635,16 @@ def login_google(driver, email, password, known_totp_secret=None):
             "//button[@id='identifierNext']",
             "//span[contains(text(), 'Next')]/ancestor::button",
         ]
-        email_next = find_element_with_fallback(driver, email_next_xpaths, timeout=10, description="email next button")
+        email_next = find_element_with_fallback(driver, email_next_xpaths, timeout=20, description="email next button")
         if email_next:
-            click_xpath(driver, "//*[@id='identifierNext']", timeout=5)
+            click_xpath(driver, "//*[@id='identifierNext']", timeout=10)
         else:
             # Try Enter key
             email_input.send_keys(Keys.RETURN)
         logger.info("[STEP] Email submitted")
 
         # Wait for password field
-        time.sleep(2)
+        time.sleep(3)  # Increased wait for password page to load
 
         # Enter password
         password_input_xpaths = [
@@ -648,13 +652,15 @@ def login_google(driver, email, password, known_totp_secret=None):
             "//input[@type='password']",
             "//input[@aria-label*='password' or @aria-label*='Password']",
         ]
-        password_input = find_element_with_fallback(driver, password_input_xpaths, timeout=20, description="password input")
+        password_input = find_element_with_fallback(driver, password_input_xpaths, timeout=30, description="password input")
         if not password_input:
             return False, "LOGIN_PASSWORD_FIELD_NOT_FOUND", "Password field not found after email submission"
         
         password_input.clear()
+        time.sleep(0.5)
         password_input.send_keys(password)
         logger.info("[STEP] Password entered")
+        time.sleep(1)
         
         # Click Next button
         pw_next_xpaths = [
@@ -662,17 +668,17 @@ def login_google(driver, email, password, known_totp_secret=None):
             "//button[@id='passwordNext']",
             "//span[contains(text(), 'Next')]/ancestor::button",
         ]
-        pw_next = find_element_with_fallback(driver, pw_next_xpaths, timeout=10, description="password next button")
+        pw_next = find_element_with_fallback(driver, pw_next_xpaths, timeout=20, description="password next button")
         if pw_next:
-            click_xpath(driver, "//*[@id='passwordNext']", timeout=5)
+            click_xpath(driver, "//*[@id='passwordNext']", timeout=10)
         else:
             password_input.send_keys(Keys.RETURN)
         logger.info("[STEP] Password submitted")
 
         # Wait for potential challenge pages or account home
         # Use longer wait and check multiple times for various challenge types
-        max_wait_attempts = 10
-        wait_interval = 2
+        max_wait_attempts = 15  # Increased attempts
+        wait_interval = 3  # Increased interval for Lambda
         current_url = None
         
         for attempt in range(max_wait_attempts):
@@ -698,9 +704,9 @@ def login_google(driver, email, password, known_totp_secret=None):
             challenge_indicators = [
                 "challenge" in current_url,
                 "signin/challenge" in current_url,
-                element_exists(driver, "//input[@type='tel' or @autocomplete='one-time-code']", timeout=2),
-                element_exists(driver, "//input[contains(@aria-label, 'code') or contains(@aria-label, 'Code')]", timeout=2),
-                element_exists(driver, "//div[contains(text(), 'Enter the code') or contains(text(), 'verification code')]", timeout=2),
+                element_exists(driver, "//input[@type='tel' or @autocomplete='one-time-code']", timeout=5),
+                element_exists(driver, "//input[contains(@aria-label, 'code') or contains(@aria-label, 'Code')]", timeout=5),
+                element_exists(driver, "//div[contains(text(), 'Enter the code') or contains(text(), 'verification code')]", timeout=5),
             ]
             
             if any(challenge_indicators):
@@ -726,7 +732,7 @@ def login_google(driver, email, password, known_totp_secret=None):
             otp_input = None
             for xpath in otp_input_xpaths:
                 try:
-                    otp_input = wait_for_xpath(driver, xpath, timeout=5)
+                    otp_input = wait_for_xpath(driver, xpath, timeout=15)  # Increased timeout
                     if otp_input:
                         break
                 except:
@@ -774,16 +780,16 @@ def login_google(driver, email, password, known_totp_secret=None):
                         
                         submitted = False
                         for btn_xpath in submit_btn_xpaths:
-                            if element_exists(driver, btn_xpath, timeout=3):
-                                click_xpath(driver, btn_xpath, timeout=3)
+                            if element_exists(driver, btn_xpath, timeout=5):  # Increased timeout
+                                click_xpath(driver, btn_xpath, timeout=10)  # Increased timeout
                                 submitted = True
                                 break
                         
                         if not submitted:
                             otp_input.send_keys(Keys.RETURN)
                         
-                        # Wait and check result
-                        time.sleep(4)
+                        # Wait and check result - increased wait time
+                        time.sleep(5)  # Increased for Lambda
                         current_url = driver.current_url
                         
                         # Check if login succeeded
