@@ -9,7 +9,8 @@ COPY main.py ${LAMBDA_TASK_ROOT}/
 RUN pip install --no-cache-dir \
     boto3 \
     paramiko \
-    pyotp
+    pyotp \
+    undetected-chromedriver
 
 # The umihico base image should already have Chrome/Chromium installed
 # Let's verify what's available and log it for debugging
