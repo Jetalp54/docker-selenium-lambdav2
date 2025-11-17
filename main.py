@@ -32,7 +32,19 @@ logger.setLevel(logging.INFO)
 def get_chrome_driver():
     """
     Create a headless Chrome driver inside the umihico/aws-lambda-selenium-python image.
+    The base image already has Chrome and ChromeDriver pre-installed.
     """
+    import os
+    
+    # Set environment variables to use /tmp for Selenium cache (Lambda read-only filesystem)
+    # This is critical - Lambda filesystem is read-only except /tmp
+    os.environ['HOME'] = '/tmp'
+    os.environ['XDG_CACHE_HOME'] = '/tmp/.cache'
+    os.environ['SELENIUM_MANAGER_CACHE'] = '/tmp/.cache/selenium'
+    
+    # Disable SeleniumManager - the base image has Chrome/ChromeDriver pre-installed
+    os.environ['SE_SELENIUM_MANAGER'] = 'false'
+    
     chrome_options = Options()
     chrome_options.add_argument("--headless=new")
     chrome_options.add_argument("--no-sandbox")
@@ -41,11 +53,56 @@ def get_chrome_driver():
     chrome_options.add_argument("--window-size=1280,800")
     chrome_options.add_argument("--lang=en-US")
     chrome_options.add_argument("--disable-blink-features=AutomationControlled")
-    chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
+    chrome_options.add_argument("--single-process")  # Important for Lambda
+    chrome_options.add_argument("--disable-software-rasterizer")
+    chrome_options.add_experimental_option("excludeSwitches", ["enable-automation", "enable-logging"])
     chrome_options.add_experimental_option('useAutomationExtension', False)
+    
+    # Try to find Chrome binary in common Lambda locations
+    chrome_binary_paths = [
+        "/usr/bin/google-chrome",
+        "/usr/bin/chromium",
+        "/usr/bin/chromium-browser",
+        "/opt/chrome/headless-chromium",
+    ]
+    
+    chrome_binary = None
+    for path in chrome_binary_paths:
+        if os.path.exists(path):
+            chrome_binary = path
+            logger.info(f"[LAMBDA] Found Chrome binary at: {chrome_binary}")
+            break
+    
+    if chrome_binary:
+        chrome_options.binary_location = chrome_binary
+    
+    # Try to find ChromeDriver in common locations
+    chromedriver_paths = [
+        "/usr/bin/chromedriver",
+        "/usr/local/bin/chromedriver",
+        "/opt/chromedriver/chromedriver",
+    ]
+    
+    chromedriver_path = None
+    for path in chromedriver_paths:
+        if os.path.exists(path):
+            chromedriver_path = path
+            logger.info(f"[LAMBDA] Found ChromeDriver at: {chromedriver_path}")
+            break
 
     try:
-        driver = webdriver.Chrome(options=chrome_options)
+        # Always use Service with explicit driver path to avoid SeleniumManager
+        from selenium.webdriver.chrome.service import Service
+        
+        if chromedriver_path:
+            service = Service(executable_path=chromedriver_path)
+        else:
+            # If not found, try to use chromedriver from PATH
+            # The base image should have it in PATH
+            logger.info("[LAMBDA] ChromeDriver path not found, using PATH")
+            service = Service()  # Will use chromedriver from PATH
+        
+        driver = webdriver.Chrome(service=service, options=chrome_options)
         
         # Inject anti-detection script
         driver.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument', {
@@ -59,7 +116,25 @@ def get_chrome_driver():
     except Exception as e:
         logger.error(f"[LAMBDA] Failed to initialize Chrome driver: {e}")
         logger.error(traceback.format_exc())
-        raise
+        # Try one more time with minimal options and no service
+        try:
+            logger.info("[LAMBDA] Retrying with minimal Chrome options...")
+            minimal_options = Options()
+            minimal_options.add_argument("--headless=new")
+            minimal_options.add_argument("--no-sandbox")
+            minimal_options.add_argument("--disable-dev-shm-usage")
+            
+            if chrome_binary:
+                minimal_options.binary_location = chrome_binary
+            
+            # Try without Service - let Selenium use defaults
+            driver = webdriver.Chrome(options=minimal_options)
+            logger.info("[LAMBDA] Chrome driver initialized with minimal options")
+            return driver
+        except Exception as e2:
+            logger.error(f"[LAMBDA] Retry also failed: {e2}")
+            logger.error(traceback.format_exc())
+            raise
 
 
 def wait_for_xpath(driver, xpath, timeout=20):
