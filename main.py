@@ -347,18 +347,22 @@ def get_chrome_driver():
         # Create driver with explicit paths - this should bypass SeleniumManager
         driver = webdriver.Chrome(service=service, options=chrome_options)
         
-        # Wait a moment for Chrome to fully initialize before doing anything
-        time.sleep(1)
+        # Wait longer for Chrome to fully initialize (don't check session immediately)
+        time.sleep(2)
         
-        # Verify driver is working by checking session
+        # Try to navigate to a blank page to verify driver works (less aggressive than current_url)
         try:
-            _ = driver.current_url  # This will fail if browser crashed
+            driver.get("about:blank")
+            time.sleep(0.5)
         except Exception as e:
-            logger.error(f"[LAMBDA] Chrome driver session invalid immediately after creation: {e}")
-            driver.quit()
-            raise Exception("Chrome driver crashed immediately after initialization")
+            logger.error(f"[LAMBDA] Chrome driver failed to navigate to blank page: {e}")
+            try:
+                driver.quit()
+            except:
+                pass
+            raise Exception("Chrome driver crashed during initialization")
         
-        # Inject anti-detection script AFTER verifying driver works
+        # Inject anti-detection script (non-critical)
         try:
             driver.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument', {
                 'source': '''
@@ -393,13 +397,17 @@ def get_chrome_driver():
             service = Service(executable_path=chromedriver_path)
             driver = webdriver.Chrome(service=service, options=minimal_options)
             
-            # Wait and verify
-            time.sleep(1)
+            # Wait and verify with blank page navigation
+            time.sleep(2)
             try:
-                _ = driver.current_url
+                driver.get("about:blank")
+                time.sleep(0.5)
             except Exception as e:
                 logger.error(f"[LAMBDA] Minimal Chrome driver also crashed: {e}")
-                driver.quit()
+                try:
+                    driver.quit()
+                except:
+                    pass
                 raise
             
             logger.info("[LAMBDA] Chrome driver initialized with minimal options")
@@ -728,84 +736,169 @@ def login_google(driver, email, password, known_totp_secret=None):
             password_input.send_keys(Keys.RETURN)
         logger.info("[STEP] Password submitted")
 
-        # Wait for potential 2FA challenge or account home
-        time.sleep(3)
-
-        current_url = driver.current_url
-        logger.info(f"[STEP] URL after login attempt: {current_url}")
-
-        # Check for account verification/ID verification required
-        if "speedbump/idvreenable" in current_url or "idvreenable" in current_url:
-            logger.error("[STEP] ID verification required - manual intervention needed")
-            return False, "ID_VERIFICATION_REQUIRED", "Manual ID verification required"
-
-        # If we're on MyAccount or Gmail, we are probably logged in
-        if "myaccount.google.com" in current_url or "mail.google.com" in current_url or "accounts.google.com/b/0" in current_url:
-            logger.info("[STEP] Login success without visible 2FA step")
-            return True, None, None
-
-        # Check for 2FA challenge (TOTP)
-        if "challenge" in current_url or "signin/challenge" in current_url or element_exists(driver, "//input[@type='tel' or @autocomplete='one-time-code']", timeout=5):
-            logger.info("[STEP] 2FA challenge detected")
-            if not known_totp_secret:
-                logger.error("[STEP] 2FA is required but no TOTP secret is available")
-                return False, "2FA_REQUIRED", "2FA required but secret is unknown"
-
-            # Generate TOTP code
+        # Wait for potential challenge pages or account home
+        # Use longer wait and check multiple times for various challenge types
+        max_wait_attempts = 10
+        wait_interval = 2
+        current_url = None
+        
+        for attempt in range(max_wait_attempts):
+            time.sleep(wait_interval)
             try:
-                clean_secret = known_totp_secret.replace(" ", "").upper()
-                totp = pyotp.TOTP(clean_secret)
-                otp_code = totp.now()
-                logger.info(f"[STEP] Generated TOTP code for challenge: {otp_code}")
+                current_url = driver.current_url
+                logger.info(f"[STEP] Check {attempt + 1}/{max_wait_attempts}: URL = {current_url}")
             except Exception as e:
-                logger.error(f"[STEP] Failed to generate TOTP code: {e}")
-                return False, "TOTP_GENERATION_FAILED", str(e)
-
-            # Try to fill OTP input
-            try:
-                otp_input_xpaths = [
-                    "//input[@type='tel']",
-                    "//input[@autocomplete='one-time-code']",
-                    "//input[@type='text' and contains(@aria-label, 'code')]",
-                ]
-                otp_input = find_element_with_fallback(driver, otp_input_xpaths, timeout=20, description="OTP input")
-                if not otp_input:
-                    return False, "OTP_INPUT_NOT_FOUND", "OTP input field not found"
-                
-                # Use JavaScript to set value (more reliable in headless)
-                driver.execute_script("arguments[0].value = '';", otp_input)
-                driver.execute_script("arguments[0].value = arguments[1];", otp_input, otp_code)
-                logger.info(f"[STEP] OTP code entered: {otp_code}")
-                
-                # Submit OTP
-                submit_btn_xpaths = [
-                    "//button[contains(@type,'submit')]",
-                    "//button[@role='button' and contains(., 'Next')]",
-                    "//span[contains(text(), 'Next')]/ancestor::button",
-                ]
-                if element_exists(driver, submit_btn_xpaths[0], timeout=5):
-                    click_xpath(driver, submit_btn_xpaths[0], timeout=5)
-                else:
-                    otp_input.send_keys(Keys.RETURN)
-                
-                time.sleep(3)
-            except Exception as e:
-                logger.error(f"[STEP] Failed to submit 2FA code: {e}")
-                return False, "2FA_SUBMIT_FAILED", str(e)
-
-            # Check if we reached account home
-            time.sleep(2)
-            current_url = driver.current_url
-            if "myaccount.google.com" in current_url or "mail.google.com" in current_url or "accounts.google.com/b/0" in current_url:
-                logger.info("[STEP] Login success after 2FA")
+                logger.error(f"[STEP] Failed to get current URL: {e}")
+                return False, "driver_crashed", f"Driver crashed while checking URL: {e}"
+            
+            # Check for account verification/ID verification required
+            if "speedbump/idvreenable" in current_url or "idvreenable" in current_url:
+                logger.error("[STEP] ID verification required - manual intervention needed")
+                return False, "ID_VERIFICATION_REQUIRED", "Manual ID verification required"
+            
+            # If we're logged in, return success
+            if any(domain in current_url for domain in ["myaccount.google.com", "mail.google.com", "accounts.google.com/b/0", "accounts.google.com/servicelogin"]):
+                logger.info("[STEP] Login success - reached account page")
                 return True, None, None
+            
+            # Check for various challenge types
+            challenge_indicators = [
+                "challenge" in current_url,
+                "signin/challenge" in current_url,
+                element_exists(driver, "//input[@type='tel' or @autocomplete='one-time-code']", timeout=2),
+                element_exists(driver, "//input[contains(@aria-label, 'code') or contains(@aria-label, 'Code')]", timeout=2),
+                element_exists(driver, "//div[contains(text(), 'Enter the code') or contains(text(), 'verification code')]", timeout=2),
+            ]
+            
+            if any(challenge_indicators):
+                logger.info(f"[STEP] Challenge page detected (attempt {attempt + 1})")
+                break
+            
+            # If no challenge detected and not logged in, continue waiting
+            if attempt < max_wait_attempts - 1:
+                logger.info(f"[STEP] Waiting for page to load... ({attempt + 1}/{max_wait_attempts})")
+        
+        # Handle challenge page if detected
+        if current_url and ("challenge" in current_url or "signin/challenge" in current_url or any(challenge_indicators)):
+            logger.info("[STEP] Processing challenge page")
+            
+            # Check if it's a TOTP challenge (we can handle) or other challenge (phone, etc.)
+            otp_input_xpaths = [
+                "//input[@type='tel']",
+                "//input[@autocomplete='one-time-code']",
+                "//input[@type='text' and contains(@aria-label, 'code')]",
+                "//input[contains(@aria-label, 'Code')]",
+            ]
+            
+            otp_input = None
+            for xpath in otp_input_xpaths:
+                try:
+                    otp_input = wait_for_xpath(driver, xpath, timeout=5)
+                    if otp_input:
+                        break
+                except:
+                    continue
+            
+            if otp_input:
+                # It's a TOTP challenge - handle it with retries
+                logger.info("[STEP] TOTP challenge detected")
+                if not known_totp_secret:
+                    logger.error("[STEP] 2FA is required but no TOTP secret is available")
+                    return False, "2FA_REQUIRED", "2FA required but secret is unknown"
+                
+                # Generate TOTP code with retries
+                otp_code = None
+                totp = None
+                for retry in range(3):
+                    try:
+                        clean_secret = known_totp_secret.replace(" ", "").upper()
+                        totp = pyotp.TOTP(clean_secret)
+                        otp_code = totp.now()
+                        logger.info(f"[STEP] Generated TOTP code (attempt {retry + 1}): {otp_code}")
+                        break
+                    except Exception as e:
+                        logger.warning(f"[STEP] TOTP generation failed (attempt {retry + 1}): {e}")
+                        if retry < 2:
+                            time.sleep(1)
+                        else:
+                            return False, "TOTP_GENERATION_FAILED", str(e)
+                
+                # Fill and submit OTP with retries
+                for retry in range(3):
+                    try:
+                        # Clear and set OTP value
+                        driver.execute_script("arguments[0].value = '';", otp_input)
+                        driver.execute_script("arguments[0].value = arguments[1];", otp_input, otp_code)
+                        logger.info(f"[STEP] OTP code entered (attempt {retry + 1}): {otp_code}")
+                        
+                        # Submit OTP
+                        submit_btn_xpaths = [
+                            "//button[contains(@type,'submit')]",
+                            "//button[@role='button' and contains(., 'Next')]",
+                            "//span[contains(text(), 'Next')]/ancestor::button",
+                            "//button[contains(., 'Verify')]",
+                        ]
+                        
+                        submitted = False
+                        for btn_xpath in submit_btn_xpaths:
+                            if element_exists(driver, btn_xpath, timeout=3):
+                                click_xpath(driver, btn_xpath, timeout=3)
+                                submitted = True
+                                break
+                        
+                        if not submitted:
+                            otp_input.send_keys(Keys.RETURN)
+                        
+                        # Wait and check result
+                        time.sleep(4)
+                        current_url = driver.current_url
+                        
+                        # Check if login succeeded
+                        if any(domain in current_url for domain in ["myaccount.google.com", "mail.google.com", "accounts.google.com/b/0"]):
+                            logger.info("[STEP] Login success after 2FA")
+                            return True, None, None
+                        
+                        # If still on challenge page, might need new code
+                        if "challenge" in current_url:
+                            if retry < 2:
+                                logger.warning(f"[STEP] Still on challenge page, retrying with new code (attempt {retry + 1})")
+                                # Generate new code
+                                try:
+                                    otp_code = totp.now()
+                                except:
+                                    pass
+                                time.sleep(2)
+                                continue
+                            else:
+                                return False, "2FA_VERIFICATION_FAILED", "OTP submitted but verification failed after 3 attempts"
+                        else:
+                            # Different page - might be success
+                            logger.info(f"[STEP] Navigated to different page: {current_url}")
+                            break
+                            
+                    except Exception as e:
+                        logger.error(f"[STEP] Failed to submit 2FA code (attempt {retry + 1}): {e}")
+                        if retry < 2:
+                            time.sleep(2)
+                        else:
+                            return False, "2FA_SUBMIT_FAILED", str(e)
+                
+                # Final check
+                time.sleep(2)
+                current_url = driver.current_url
+                if any(domain in current_url for domain in ["myaccount.google.com", "mail.google.com", "accounts.google.com/b/0"]):
+                    logger.info("[STEP] Login success after 2FA (final check)")
+                    return True, None, None
+                else:
+                    return False, "2FA_VERIFICATION_FAILED", f"OTP submitted but still on: {current_url}"
             else:
-                logger.error(f"[STEP] 2FA submitted but not redirected to account. URL={current_url}")
-                return False, "2FA_UNEXPECTED_FLOW", f"After 2FA code, got URL={current_url}"
-
-        # No explicit 2FA page detected, but also not clearly logged in
-        logger.error(f"[STEP] Unknown login state, URL={current_url}. Manual check needed.")
-        return False, "LOGIN_UNKNOWN_STATE", f"URL={current_url}"
+                # Other challenge type (phone verification, etc.) - cannot handle automatically
+                logger.error(f"[STEP] Unsupported challenge type detected on: {current_url}")
+                return False, "UNSUPPORTED_CHALLENGE", f"Challenge page detected but not TOTP: {current_url}"
+        
+        # If we get here, we waited but didn't detect login or challenge
+        logger.warning(f"[STEP] Login status unclear after waiting. Final URL: {current_url}")
+        return False, "LOGIN_TIMEOUT", f"Could not determine login status. URL: {current_url}"
 
     except TimeoutException as e:
         logger.error(f"[STEP] Timeout during login: {e}")
