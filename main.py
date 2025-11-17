@@ -44,16 +44,22 @@ def get_chrome_driver():
     chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
     chrome_options.add_experimental_option('useAutomationExtension', False)
 
-    driver = webdriver.Chrome(options=chrome_options)
-    
-    # Inject anti-detection script
-    driver.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument', {
-        'source': '''
-            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-        '''
-    })
-    
-    return driver
+    try:
+        driver = webdriver.Chrome(options=chrome_options)
+        
+        # Inject anti-detection script
+        driver.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument', {
+            'source': '''
+                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+            '''
+        })
+        
+        logger.info("[LAMBDA] Chrome driver initialized successfully")
+        return driver
+    except Exception as e:
+        logger.error(f"[LAMBDA] Failed to initialize Chrome driver: {e}")
+        logger.error(traceback.format_exc())
+        raise
 
 
 def wait_for_xpath(driver, xpath, timeout=20):
@@ -930,8 +936,15 @@ def handler(event, context):
       app_passwords_s3_key
       timings         = dict of step timings
     """
-
-    logger.info(f"[LAMBDA] Received event: {json.dumps(event)}")
+    
+    # Ensure logging is properly configured
+    logger.setLevel(logging.INFO)
+    logger.info("=" * 60)
+    logger.info("[LAMBDA] Handler invoked")
+    logger.info(f"[LAMBDA] Event type: {type(event)}")
+    logger.info(f"[LAMBDA] Event content: {json.dumps(event) if isinstance(event, dict) else str(event)}")
+    logger.info(f"[LAMBDA] Context: {context}")
+    logger.info("=" * 60)
 
     email = event.get("email") or os.environ.get("GW_EMAIL")
     password = event.get("password") or os.environ.get("GW_PASSWORD")
