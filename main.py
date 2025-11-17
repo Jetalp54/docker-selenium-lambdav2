@@ -102,11 +102,34 @@ def get_chrome_driver():
     chrome_options.add_experimental_option("excludeSwitches", ["enable-automation", "enable-logging"])
     chrome_options.add_experimental_option('useAutomationExtension', False)
     
+    # DEBUG: List what's actually in /opt to see what the base image contains
+    logger.info("[LAMBDA] Checking /opt directory contents...")
+    try:
+        if os.path.exists('/opt'):
+            opt_contents = os.listdir('/opt')
+            logger.info(f"[LAMBDA] Contents of /opt: {opt_contents}")
+            # Check subdirectories
+            for item in opt_contents:
+                item_path = os.path.join('/opt', item)
+                if os.path.isdir(item_path):
+                    try:
+                        sub_contents = os.listdir(item_path)
+                        logger.info(f"[LAMBDA] Contents of /opt/{item}: {sub_contents[:10]}")
+                    except:
+                        pass
+    except Exception as e:
+        logger.warning(f"[LAMBDA] Could not list /opt: {e}")
+    
     # Find Chrome binary - umihico base image may have it in various locations
     # Try multiple methods: direct path check, which command, find command
     chrome_binary_paths = [
         "/opt/chrome/headless-chromium",
         "/opt/chrome/chromium",
+        "/opt/chrome/chrome",
+        "/opt/chrome/google-chrome",
+        "/opt/chrome/google-chrome-stable",
+        "/opt/headless-chromium",
+        "/opt/chromium",
         "/usr/bin/google-chrome",
         "/usr/bin/google-chrome-stable",
         "/usr/bin/chromium",
@@ -259,6 +282,19 @@ def get_chrome_driver():
 
     # CRITICAL: Chrome binary MUST be found, otherwise SeleniumManager will try to find it
     if not chrome_binary:
+        # Final debug: list all executable files in /opt
+        logger.error("[LAMBDA] Chrome binary not found! Listing all files in /opt for debugging...")
+        try:
+            for root, dirs, files in os.walk('/opt'):
+                for file in files:
+                    file_path = os.path.join(root, file)
+                    if os.access(file_path, os.X_OK):
+                        logger.info(f"[LAMBDA] Executable found: {file_path}")
+                        if 'chrome' in file.lower() or 'chromium' in file.lower():
+                            logger.info(f"[LAMBDA] CHROME-RELATED EXECUTABLE: {file_path}")
+        except Exception as e:
+            logger.warning(f"[LAMBDA] Could not walk /opt: {e}")
+        
         raise Exception("Chrome binary not found! Cannot proceed without Chrome binary path. Checked paths: " + str(chrome_binary_paths))
     
     try:
