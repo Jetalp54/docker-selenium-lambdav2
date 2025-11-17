@@ -6,13 +6,10 @@ COPY main.py ${LAMBDA_TASK_ROOT}/
 # Install required Python dependencies
 # Note: The base image already has selenium installed
 # We install additional dependencies needed for our Lambda
-# setuptools provides distutils (required by undetected-chromedriver in Python 3.12+)
 RUN pip install --no-cache-dir \
-    setuptools \
     boto3 \
     paramiko \
-    pyotp \
-    undetected-chromedriver
+    pyotp
 
 # The umihico base image should already have Chrome/Chromium installed
 # Let's verify what's available and log it for debugging
