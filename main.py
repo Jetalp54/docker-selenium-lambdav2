@@ -102,45 +102,85 @@ def get_chrome_driver():
     chrome_options.add_experimental_option("excludeSwitches", ["enable-automation", "enable-logging"])
     chrome_options.add_experimental_option('useAutomationExtension', False)
     
-    # Find Chrome binary - umihico base image typically has it at /opt/chrome/headless-chromium
-    # or we can use which/google-chrome
+    # Find Chrome binary - umihico base image may have it in various locations
+    # Try multiple methods: direct path check, which command, find command
     chrome_binary_paths = [
-        "/opt/chrome/headless-chromium",  # Most common in umihico image
+        "/opt/chrome/headless-chromium",
+        "/opt/chrome/chromium",
         "/usr/bin/google-chrome",
+        "/usr/bin/google-chrome-stable",
         "/usr/bin/chromium",
         "/usr/bin/chromium-browser",
+        "/usr/local/bin/google-chrome",
+        "/usr/local/bin/chromium",
     ]
     
     chrome_binary = None
+    
+    # First, try direct path checks
     for path in chrome_binary_paths:
         if os.path.exists(path):
             chrome_binary = path
             logger.info(f"[LAMBDA] Found Chrome binary at: {chrome_binary}")
             break
     
-    # If not found, try using 'which' command
+    # If not found, try using 'which' command for various names
+    if not chrome_binary:
+        for cmd in ['google-chrome', 'google-chrome-stable', 'chromium', 'chromium-browser', 'chrome']:
+            try:
+                result = subprocess.run(['which', cmd], capture_output=True, text=True, timeout=2)
+                if result.returncode == 0 and result.stdout.strip():
+                    candidate = result.stdout.strip()
+                    if os.path.exists(candidate):
+                        chrome_binary = candidate
+                        logger.info(f"[LAMBDA] Found Chrome binary via which {cmd}: {chrome_binary}")
+                        break
+            except:
+                continue
+    
+    # Last resort: try 'find' command in common directories
     if not chrome_binary:
         try:
-            result = subprocess.run(['which', 'google-chrome'], capture_output=True, text=True, timeout=2)
-            if result.returncode == 0 and result.stdout.strip():
-                chrome_binary = result.stdout.strip()
-                logger.info(f"[LAMBDA] Found Chrome binary via which: {chrome_binary}")
-        except:
-            pass
+            logger.info("[LAMBDA] Attempting to find Chrome using find command...")
+            # Use separate find commands for better compatibility
+            for pattern in ['chrome', 'chromium', 'google-chrome*']:
+                try:
+                    # Use shell=False with proper find syntax
+                    result = subprocess.run(
+                        ['find', '/usr', '/opt', '/var', '-type', 'f', '-name', pattern],
+                        capture_output=True, text=True, timeout=5, stderr=subprocess.DEVNULL
+                    )
+                    if result.returncode == 0 and result.stdout.strip():
+                        for line in result.stdout.strip().split('\n'):
+                            line = line.strip()
+                            if line and os.path.exists(line) and os.access(line, os.X_OK):
+                                chrome_binary = line
+                                logger.info(f"[LAMBDA] Found Chrome binary via find: {chrome_binary}")
+                                break
+                    if chrome_binary:
+                        break
+                except:
+                    continue
+        except Exception as e:
+            logger.warning(f"[LAMBDA] Find command failed: {e}")
     
     if chrome_binary:
         chrome_options.binary_location = chrome_binary
     else:
         logger.warning("[LAMBDA] Chrome binary not found in standard locations")
     
-    # Find ChromeDriver - umihico base image should have it in PATH
+    # Find ChromeDriver - try multiple methods
     chromedriver_paths = [
-        "/usr/bin/chromedriver",  # Most common
+        "/usr/bin/chromedriver",
         "/usr/local/bin/chromedriver",
         "/opt/chromedriver/chromedriver",
+        "/opt/chromedriver",
+        "/var/task/chromedriver",  # Sometimes in Lambda task root
     ]
     
     chromedriver_path = None
+    
+    # First, try direct path checks
     for path in chromedriver_paths:
         if os.path.exists(path):
             chromedriver_path = path
@@ -149,17 +189,73 @@ def get_chrome_driver():
     
     # If not found, try using 'which' command
     if not chromedriver_path:
+        for cmd in ['chromedriver', 'chromedriver-linux64', 'chromedriver-linux']:
+            try:
+                result = subprocess.run(['which', cmd], capture_output=True, text=True, timeout=2)
+                if result.returncode == 0 and result.stdout.strip():
+                    candidate = result.stdout.strip()
+                    if os.path.exists(candidate):
+                        chromedriver_path = candidate
+                        logger.info(f"[LAMBDA] Found ChromeDriver via which {cmd}: {chromedriver_path}")
+                        break
+            except:
+                continue
+    
+    # Last resort: try 'find' command
+    if not chromedriver_path:
         try:
-            result = subprocess.run(['which', 'chromedriver'], capture_output=True, text=True, timeout=2)
+            logger.info("[LAMBDA] Attempting to find ChromeDriver using find command...")
+            result = subprocess.run(
+                ['find', '/usr', '/opt', '/var', '-type', 'f', '-name', 'chromedriver*'],
+                capture_output=True, text=True, timeout=5, stderr=subprocess.DEVNULL
+            )
             if result.returncode == 0 and result.stdout.strip():
-                chromedriver_path = result.stdout.strip()
-                logger.info(f"[LAMBDA] Found ChromeDriver via which: {chromedriver_path}")
-        except:
-            pass
+                for line in result.stdout.strip().split('\n'):
+                    line = line.strip()
+                    if line and os.path.exists(line) and os.access(line, os.X_OK):
+                        chromedriver_path = line
+                        logger.info(f"[LAMBDA] Found ChromeDriver via find: {chromedriver_path}")
+                        break
+        except Exception as e:
+            logger.warning(f"[LAMBDA] Find command for ChromeDriver failed: {e}")
 
     if not chromedriver_path:
-        logger.error("[LAMBDA] ChromeDriver not found! This should not happen with umihico base image.")
-        raise Exception("ChromeDriver not found in base image. Check Docker image build.")
+        logger.error("[LAMBDA] ChromeDriver not found! Attempting to list common directories for debugging...")
+        # Debug: list what's in common directories
+        debug_dirs = ['/usr/bin', '/usr/local/bin', '/opt', '/opt/chrome', '/opt/chromedriver', '/var/task', '/var/lang']
+        for debug_dir in debug_dirs:
+            try:
+                if os.path.exists(debug_dir):
+                    files = os.listdir(debug_dir)
+                    logger.info(f"[LAMBDA] Contents of {debug_dir}: {files[:20]}")  # First 20 items
+                    # Also check for any chrome/chromedriver related files
+                    chrome_files = [f for f in files if 'chrome' in f.lower() or 'chromium' in f.lower()]
+                    if chrome_files:
+                        logger.info(f"[LAMBDA] Chrome-related files in {debug_dir}: {chrome_files}")
+            except Exception as e:
+                logger.warning(f"[LAMBDA] Could not list {debug_dir}: {e}")
+        
+        # Try one more thing: check if chromedriver is in PATH but not found by which
+        try:
+            logger.info("[LAMBDA] Checking PATH environment variable...")
+            path_dirs = os.environ.get('PATH', '').split(':')
+            for path_dir in path_dirs:
+                if path_dir and os.path.exists(path_dir):
+                    try:
+                        files = os.listdir(path_dir)
+                        if 'chromedriver' in files:
+                            candidate = os.path.join(path_dir, 'chromedriver')
+                            if os.access(candidate, os.X_OK):
+                                chromedriver_path = candidate
+                                logger.info(f"[LAMBDA] Found ChromeDriver in PATH directory: {chromedriver_path}")
+                                break
+                    except:
+                        continue
+        except:
+            pass
+        
+        if not chromedriver_path:
+            raise Exception("ChromeDriver not found in base image. Check Docker image build.")
 
     # CRITICAL: Chrome binary MUST be found, otherwise SeleniumManager will try to find it
     if not chrome_binary:
