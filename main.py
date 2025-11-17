@@ -91,14 +91,27 @@ def get_chrome_driver():
     
     # Use Selenium Chrome options with anti-detection
     chrome_options = Options()
-    # ABSOLUTE MINIMUM options - proven to work in Lambda
-    # Don't add anything that might cause crashes
+    
+    # Core stability options for Lambda
     chrome_options.add_argument("--headless=new")
     chrome_options.add_argument("--no-sandbox")
     chrome_options.add_argument("--disable-dev-shm-usage")
     chrome_options.add_argument("--disable-gpu")
     chrome_options.add_argument("--window-size=1280,800")
     chrome_options.add_argument("--lang=en-US")
+    
+    # Additional stability options for Lambda environment
+    chrome_options.add_argument("--single-process")  # Critical for Lambda
+    chrome_options.add_argument("--disable-background-networking")
+    chrome_options.add_argument("--disable-default-apps")
+    chrome_options.add_argument("--disable-extensions")
+    chrome_options.add_argument("--disable-sync")
+    chrome_options.add_argument("--metrics-recording-only")
+    chrome_options.add_argument("--mute-audio")
+    chrome_options.add_argument("--no-first-run")
+    chrome_options.add_argument("--safebrowsing-disable-auto-update")
+    chrome_options.add_argument("--disable-setuid-sandbox")
+    chrome_options.add_argument("--disable-software-rasterizer")
     
     # Anti-detection options (Lambda-compatible)
     chrome_options.add_argument("--disable-blink-features=AutomationControlled")
@@ -322,10 +335,14 @@ def get_chrome_driver():
         # Create driver with explicit paths - this bypasses SeleniumManager
         driver = webdriver.Chrome(service=service, options=chrome_options)
         
-        # Wait briefly for Chrome to start (but don't verify)
-        time.sleep(3)
+        # Set page load timeout BEFORE any operations
+        driver.set_page_load_timeout(60)
         
-        # Inject anti-detection scripts (Lambda-compatible)
+        # Wait for Chrome to fully initialize
+        time.sleep(2)
+        
+        # Inject anti-detection scripts AFTER driver is stable
+        # Do this BEFORE any navigation to ensure it's applied to all pages
         try:
             driver.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument', {
                 'source': '''
@@ -335,11 +352,12 @@ def get_chrome_driver():
                     window.chrome = {runtime: {}};
                 '''
             })
+            logger.info("[LAMBDA] Anti-detection script injected successfully")
         except Exception as e:
             logger.warning(f"[LAMBDA] Could not inject anti-detection script (non-critical): {e}")
-            # Continue anyway - this is not critical
+            # Continue anyway - this is not critical, but log it
         
-        logger.info("[LAMBDA] Chrome driver created successfully with anti-detection")
+        logger.info("[LAMBDA] Chrome driver created successfully")
         return driver
     except Exception as e:
         logger.error(f"[LAMBDA] Failed to initialize Chrome driver: {e}")
@@ -354,6 +372,7 @@ def get_chrome_driver():
             minimal_options.add_argument("--no-sandbox")
             minimal_options.add_argument("--disable-dev-shm-usage")
             minimal_options.add_argument("--disable-gpu")
+            minimal_options.add_argument("--single-process")  # Critical for Lambda stability
             
             if chrome_binary:
                 minimal_options.binary_location = chrome_binary
@@ -620,26 +639,19 @@ def login_google(driver, email, password, known_totp_secret=None):
     """
     logger.info(f"[STEP] Login started for {email}")
     
-    # Verify driver is still alive before navigation
-    try:
-        _ = driver.current_url
-    except Exception as e:
-        logger.error(f"[STEP] Driver session invalid before navigation: {e}")
-        return False, "driver_crashed", f"Driver crashed before navigation: {e}"
+    # Don't check driver health before navigation - it can cause crashes in Lambda
+    # Just proceed directly to navigation
     
     # Navigate with timeout and error handling
     try:
-        driver.set_page_load_timeout(60)  # Increased for Lambda
+        logger.info("[STEP] Navigating to Google login page...")
         driver.get("https://accounts.google.com/signin/v2/identifier?hl=en&flowName=GlifWebSignIn")
         logger.info("[STEP] Navigation to Google login page completed")
-        time.sleep(3)  # Increased wait for page to fully load
+        time.sleep(3)  # Increased wait for page to fully load in Lambda
+        logger.info("[STEP] Page stabilized, proceeding with login")
     except Exception as nav_error:
         logger.error(f"[STEP] Navigation failed: {nav_error}")
-        # Check if driver is still alive
-        try:
-            _ = driver.current_url
-        except:
-            return False, "driver_crashed", f"Driver crashed during navigation: {nav_error}"
+        logger.error(traceback.format_exc())
         return False, "navigation_failed", str(nav_error)
 
     try:
