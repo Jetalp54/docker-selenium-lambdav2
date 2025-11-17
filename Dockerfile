@@ -1,7 +1,12 @@
 FROM umihico/aws-lambda-selenium-python:latest
 
-# Copy our Lambda handler into the Lambda task root
-COPY main.py ${LAMBDA_TASK_ROOT}/
+# Copy Lambda entry
+COPY main.py ./
 
-# Entrypoint for AWS Lambda (module.function)
+# Extra dependencies needed for this flow
+# - boto3   : to talk to S3
+# - paramiko: SFTP to your server to save secret key
+# - pyotp   : TOTP generation (when needed)
+RUN pip install --no-cache-dir boto3 paramiko pyotp
+
 CMD ["main.handler"]
