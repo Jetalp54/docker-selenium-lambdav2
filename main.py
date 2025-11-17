@@ -347,12 +347,27 @@ def get_chrome_driver():
         # Create driver with explicit paths - this should bypass SeleniumManager
         driver = webdriver.Chrome(service=service, options=chrome_options)
         
-        # Inject anti-detection script
-        driver.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument', {
-            'source': '''
-                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-            '''
-        })
+        # Wait a moment for Chrome to fully initialize before doing anything
+        time.sleep(1)
+        
+        # Verify driver is working by checking session
+        try:
+            _ = driver.current_url  # This will fail if browser crashed
+        except Exception as e:
+            logger.error(f"[LAMBDA] Chrome driver session invalid immediately after creation: {e}")
+            driver.quit()
+            raise Exception("Chrome driver crashed immediately after initialization")
+        
+        # Inject anti-detection script AFTER verifying driver works
+        try:
+            driver.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument', {
+                'source': '''
+                    Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+                '''
+            })
+        except Exception as e:
+            logger.warning(f"[LAMBDA] Could not inject anti-detection script (non-critical): {e}")
+            # Continue anyway - this is not critical
         
         logger.info("[LAMBDA] Chrome driver initialized successfully")
         return driver
@@ -360,18 +375,16 @@ def get_chrome_driver():
         logger.error(f"[LAMBDA] Failed to initialize Chrome driver: {e}")
         logger.error(traceback.format_exc())
         
-        # Last resort: try with just chromedriver path and minimal options
+        # Last resort: try with absolute minimal options
         try:
-            logger.info("[LAMBDA] Retrying with minimal options and explicit paths...")
+            logger.info("[LAMBDA] Retrying with absolute minimal options...")
             minimal_options = Options()
+            # Only the absolute essentials
             minimal_options.add_argument("--headless=new")
             minimal_options.add_argument("--no-sandbox")
             minimal_options.add_argument("--disable-dev-shm-usage")
             minimal_options.add_argument("--disable-gpu")
-            minimal_options.add_argument("--disable-software-rasterizer")
-            minimal_options.add_argument("--single-process")
-            minimal_options.add_argument("--disable-setuid-sandbox")
-            minimal_options.add_argument("--remote-debugging-port=9222")
+            minimal_options.add_argument("--window-size=1280,800")
             
             if chrome_binary:
                 minimal_options.binary_location = chrome_binary
@@ -379,6 +392,16 @@ def get_chrome_driver():
             # Service is already imported at the top - don't import again
             service = Service(executable_path=chromedriver_path)
             driver = webdriver.Chrome(service=service, options=minimal_options)
+            
+            # Wait and verify
+            time.sleep(1)
+            try:
+                _ = driver.current_url
+            except Exception as e:
+                logger.error(f"[LAMBDA] Minimal Chrome driver also crashed: {e}")
+                driver.quit()
+                raise
+            
             logger.info("[LAMBDA] Chrome driver initialized with minimal options")
             return driver
         except Exception as e2:
@@ -631,8 +654,28 @@ def login_google(driver, email, password, known_totp_secret=None):
     we will try to solve it; otherwise we fail with an explicit error.
     """
     logger.info(f"[STEP] Login started for {email}")
-    driver.get("https://accounts.google.com/signin/v2/identifier?hl=en&flowName=GlifWebSignIn")
-    time.sleep(2)
+    
+    # Verify driver is still alive before navigation
+    try:
+        _ = driver.current_url
+    except Exception as e:
+        logger.error(f"[STEP] Driver session invalid before navigation: {e}")
+        return False, "driver_crashed", f"Driver crashed before navigation: {e}"
+    
+    # Navigate with timeout and error handling
+    try:
+        driver.set_page_load_timeout(30)
+        driver.get("https://accounts.google.com/signin/v2/identifier?hl=en&flowName=GlifWebSignIn")
+        logger.info("[STEP] Navigation to Google login page completed")
+        time.sleep(2)
+    except Exception as nav_error:
+        logger.error(f"[STEP] Navigation failed: {nav_error}")
+        # Check if driver is still alive
+        try:
+            _ = driver.current_url
+        except:
+            return False, "driver_crashed", f"Driver crashed during navigation: {nav_error}"
+        return False, "navigation_failed", str(nav_error)
 
     try:
         # Enter email
