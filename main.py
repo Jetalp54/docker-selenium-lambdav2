@@ -4,6 +4,7 @@ import time
 import logging
 import traceback
 import io
+import sys
 
 import boto3
 import paramiko
@@ -11,6 +12,7 @@ import pyotp
 
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait
@@ -21,8 +23,27 @@ from selenium.common.exceptions import (
     WebDriverException,
 )
 
+# Initialize logger first
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
+
+# Monkey-patch SeleniumManager to prevent it from running
+# This is a workaround for Selenium 4.x trying to use SeleniumManager even with explicit paths
+try:
+    from selenium.webdriver.common.selenium_manager import SeleniumManager
+    
+    def patched_binary_paths(self, *args, **kwargs):
+        # If executable_path is provided in service, don't use SeleniumManager
+        # Return empty dict to force Selenium to use provided paths
+        logger.info("[LAMBDA] SeleniumManager.binary_paths called - attempting to bypass")
+        return {'driver_path': '', 'browser_path': ''}
+    
+    # Only patch if we're in Lambda environment
+    if os.environ.get('AWS_LAMBDA_FUNCTION_NAME'):
+        SeleniumManager.binary_paths = patched_binary_paths
+        logger.info("[LAMBDA] SeleniumManager patched to prevent execution")
+except Exception as e:
+    logger.warning(f"[LAMBDA] Could not patch SeleniumManager: {e}")
 
 # =====================================================================
 # Helpers: Selenium driver in Lambda
@@ -33,8 +54,29 @@ def get_chrome_driver():
     """
     Create a headless Chrome driver inside the umihico/aws-lambda-selenium-python image.
     The base image already has Chrome and ChromeDriver pre-installed.
+    We MUST bypass SeleniumManager completely to avoid "No space left on device" errors.
+    
+    Strategy:
+    1. Find Chrome and ChromeDriver binaries explicitly
+    2. Set environment variables to disable SeleniumManager
+    3. Use Service with explicit executable_path
+    4. Set binary_location in options
+    5. Clean /tmp to ensure space is available
     """
     import os
+    import subprocess
+    import shutil
+    
+    # Clean /tmp to ensure we have space (Lambda /tmp is limited to 512MB)
+    try:
+        # Only clean selenium cache, not everything in /tmp
+        cache_dir = '/tmp/.cache/selenium'
+        if os.path.exists(cache_dir):
+            shutil.rmtree(cache_dir, ignore_errors=True)
+        os.makedirs(cache_dir, exist_ok=True)
+        logger.info("[LAMBDA] Cleaned /tmp/.cache/selenium directory")
+    except Exception as e:
+        logger.warning(f"[LAMBDA] Could not clean /tmp cache: {e}")
     
     # Set environment variables to use /tmp for Selenium cache (Lambda read-only filesystem)
     # This is critical - Lambda filesystem is read-only except /tmp
@@ -42,8 +84,10 @@ def get_chrome_driver():
     os.environ['XDG_CACHE_HOME'] = '/tmp/.cache'
     os.environ['SELENIUM_MANAGER_CACHE'] = '/tmp/.cache/selenium'
     
-    # Disable SeleniumManager - the base image has Chrome/ChromeDriver pre-installed
+    # Completely disable SeleniumManager - use multiple methods
     os.environ['SE_SELENIUM_MANAGER'] = 'false'
+    os.environ['SELENIUM_MANAGER'] = 'false'
+    os.environ['SELENIUM_DISABLE_DRIVER_MANAGER'] = '1'
     
     chrome_options = Options()
     chrome_options.add_argument("--headless=new")
@@ -58,12 +102,13 @@ def get_chrome_driver():
     chrome_options.add_experimental_option("excludeSwitches", ["enable-automation", "enable-logging"])
     chrome_options.add_experimental_option('useAutomationExtension', False)
     
-    # Try to find Chrome binary in common Lambda locations
+    # Find Chrome binary - umihico base image typically has it at /opt/chrome/headless-chromium
+    # or we can use which/google-chrome
     chrome_binary_paths = [
+        "/opt/chrome/headless-chromium",  # Most common in umihico image
         "/usr/bin/google-chrome",
         "/usr/bin/chromium",
         "/usr/bin/chromium-browser",
-        "/opt/chrome/headless-chromium",
     ]
     
     chrome_binary = None
@@ -73,12 +118,24 @@ def get_chrome_driver():
             logger.info(f"[LAMBDA] Found Chrome binary at: {chrome_binary}")
             break
     
+    # If not found, try using 'which' command
+    if not chrome_binary:
+        try:
+            result = subprocess.run(['which', 'google-chrome'], capture_output=True, text=True, timeout=2)
+            if result.returncode == 0 and result.stdout.strip():
+                chrome_binary = result.stdout.strip()
+                logger.info(f"[LAMBDA] Found Chrome binary via which: {chrome_binary}")
+        except:
+            pass
+    
     if chrome_binary:
         chrome_options.binary_location = chrome_binary
+    else:
+        logger.warning("[LAMBDA] Chrome binary not found in standard locations")
     
-    # Try to find ChromeDriver in common locations
+    # Find ChromeDriver - umihico base image should have it in PATH
     chromedriver_paths = [
-        "/usr/bin/chromedriver",
+        "/usr/bin/chromedriver",  # Most common
         "/usr/local/bin/chromedriver",
         "/opt/chromedriver/chromedriver",
     ]
@@ -89,19 +146,42 @@ def get_chrome_driver():
             chromedriver_path = path
             logger.info(f"[LAMBDA] Found ChromeDriver at: {chromedriver_path}")
             break
+    
+    # If not found, try using 'which' command
+    if not chromedriver_path:
+        try:
+            result = subprocess.run(['which', 'chromedriver'], capture_output=True, text=True, timeout=2)
+            if result.returncode == 0 and result.stdout.strip():
+                chromedriver_path = result.stdout.strip()
+                logger.info(f"[LAMBDA] Found ChromeDriver via which: {chromedriver_path}")
+        except:
+            pass
 
+    if not chromedriver_path:
+        logger.error("[LAMBDA] ChromeDriver not found! This should not happen with umihico base image.")
+        raise Exception("ChromeDriver not found in base image. Check Docker image build.")
+
+    # CRITICAL: Chrome binary MUST be found, otherwise SeleniumManager will try to find it
+    if not chrome_binary:
+        raise Exception("Chrome binary not found! Cannot proceed without Chrome binary path. Checked paths: " + str(chrome_binary_paths))
+    
     try:
-        # Always use Service with explicit driver path to avoid SeleniumManager
-        from selenium.webdriver.chrome.service import Service
+        # Create Service with explicit ChromeDriver path
+        # This should prevent SeleniumManager from trying to download/find the driver
+        service = Service(executable_path=chromedriver_path)
         
-        if chromedriver_path:
-            service = Service(executable_path=chromedriver_path)
-        else:
-            # If not found, try to use chromedriver from PATH
-            # The base image should have it in PATH
-            logger.info("[LAMBDA] ChromeDriver path not found, using PATH")
-            service = Service()  # Will use chromedriver from PATH
+        # Set browser executable path in options - CRITICAL to prevent SeleniumManager
+        chrome_options.binary_location = chrome_binary
         
+        # Set environment variables one more time right before driver creation
+        os.environ['SE_SELENIUM_MANAGER'] = 'false'
+        os.environ['SELENIUM_MANAGER'] = 'false'
+        os.environ['SELENIUM_DISABLE_DRIVER_MANAGER'] = '1'
+        
+        logger.info(f"[LAMBDA] Initializing Chrome driver with ChromeDriver: {chromedriver_path}, Chrome: {chrome_binary}")
+        logger.info(f"[LAMBDA] Environment: SE_SELENIUM_MANAGER={os.environ.get('SE_SELENIUM_MANAGER')}")
+        
+        # Create driver with explicit paths - this should bypass SeleniumManager
         driver = webdriver.Chrome(service=service, options=chrome_options)
         
         # Inject anti-detection script
@@ -116,9 +196,10 @@ def get_chrome_driver():
     except Exception as e:
         logger.error(f"[LAMBDA] Failed to initialize Chrome driver: {e}")
         logger.error(traceback.format_exc())
-        # Try one more time with minimal options and no service
+        
+        # Last resort: try with just chromedriver path and minimal options
         try:
-            logger.info("[LAMBDA] Retrying with minimal Chrome options...")
+            logger.info("[LAMBDA] Retrying with minimal options and explicit paths...")
             minimal_options = Options()
             minimal_options.add_argument("--headless=new")
             minimal_options.add_argument("--no-sandbox")
@@ -127,14 +208,15 @@ def get_chrome_driver():
             if chrome_binary:
                 minimal_options.binary_location = chrome_binary
             
-            # Try without Service - let Selenium use defaults
-            driver = webdriver.Chrome(options=minimal_options)
+            from selenium.webdriver.chrome.service import Service
+            service = Service(executable_path=chromedriver_path)
+            driver = webdriver.Chrome(service=service, options=minimal_options)
             logger.info("[LAMBDA] Chrome driver initialized with minimal options")
             return driver
         except Exception as e2:
-            logger.error(f"[LAMBDA] Retry also failed: {e2}")
+            logger.error(f"[LAMBDA] Final retry also failed: {e2}")
             logger.error(traceback.format_exc())
-            raise
+            raise Exception(f"Chrome driver initialization failed: {e2}. Chrome: {chrome_binary}, ChromeDriver: {chromedriver_path}")
 
 
 def wait_for_xpath(driver, xpath, timeout=20):
