@@ -1,7 +1,13 @@
 FROM umihico/aws-lambda-selenium-python:latest
 
-COPY main.py ./
+# Copy the Lambda handler
+COPY main.py ${LAMBDA_TASK_ROOT}/
 
-RUN pip install --no-cache-dir boto3 paramiko pyotp
+# Install required Python dependencies
+RUN pip install --no-cache-dir \
+    boto3 \
+    paramiko \
+    pyotp
 
+# Set the Lambda handler entrypoint
 CMD ["main.handler"]
