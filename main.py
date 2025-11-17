@@ -9,10 +9,8 @@ import sys
 import boto3
 import paramiko
 import pyotp
+import undetected_chromedriver as uc
 
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait
@@ -89,49 +87,16 @@ def get_chrome_driver():
     os.environ['SELENIUM_MANAGER'] = 'false'
     os.environ['SELENIUM_DISABLE_DRIVER_MANAGER'] = '1'
     
-    chrome_options = Options()
-    # Core headless and sandbox options
+    # Use undetected-chromedriver options
+    chrome_options = uc.ChromeOptions()
+    # ABSOLUTE MINIMUM options - proven to work in Lambda
+    # Don't add anything that might cause crashes
     chrome_options.add_argument("--headless=new")
     chrome_options.add_argument("--no-sandbox")
     chrome_options.add_argument("--disable-dev-shm-usage")
-    chrome_options.add_argument("--disable-setuid-sandbox")
-    
-    # GPU and rendering
     chrome_options.add_argument("--disable-gpu")
-    chrome_options.add_argument("--disable-software-rasterizer")
-    chrome_options.add_argument("--disable-features=VizDisplayCompositor")
-    
-    # Stability options for Lambda
-    chrome_options.add_argument("--disable-extensions")
-    chrome_options.add_argument("--disable-background-timer-throttling")
-    chrome_options.add_argument("--disable-backgrounding-occluded-windows")
-    chrome_options.add_argument("--disable-renderer-backgrounding")
-    chrome_options.add_argument("--disable-ipc-flooding-protection")
-    chrome_options.add_argument("--disable-features=TranslateUI,BlinkGenPropertyTrees")
-    
-    # Window and language
     chrome_options.add_argument("--window-size=1280,800")
     chrome_options.add_argument("--lang=en-US")
-    
-    # Anti-detection
-    chrome_options.add_argument("--disable-blink-features=AutomationControlled")
-    chrome_options.add_experimental_option("excludeSwitches", ["enable-automation", "enable-logging"])
-    chrome_options.add_experimental_option('useAutomationExtension', False)
-    
-    # Memory and process management - CRITICAL for Lambda
-    # Note: --single-process can cause crashes, so we use multi-process but limit it
-    chrome_options.add_argument("--max_old_space_size=512")
-    chrome_options.add_argument("--disable-background-networking")
-    
-    # Remote debugging (optional, can help with debugging)
-    chrome_options.add_argument("--remote-debugging-port=9222")
-    
-    # Preferences
-    chrome_options.add_experimental_option("prefs", {
-        "profile.default_content_setting_values.notifications": 2,
-        "profile.default_content_settings.popups": 0,
-        "profile.managed_default_content_settings.images": 1,
-    })
     
     # DEBUG: List what's actually in /opt to see what the base image contains
     logger.info("[LAMBDA] Checking /opt directory contents...")
@@ -329,88 +294,56 @@ def get_chrome_driver():
         raise Exception("Chrome binary not found! Cannot proceed without Chrome binary path. Checked paths: " + str(chrome_binary_paths))
     
     try:
-        # Create Service with explicit ChromeDriver path
-        # Service is already imported at the top of the file
-        service = Service(executable_path=chromedriver_path)
-        
-        # Set browser executable path in options - CRITICAL to prevent SeleniumManager
-        chrome_options.binary_location = chrome_binary
-        
-        # Set environment variables one more time right before driver creation
+        # Set environment variables to disable SeleniumManager
         os.environ['SE_SELENIUM_MANAGER'] = 'false'
         os.environ['SELENIUM_MANAGER'] = 'false'
         os.environ['SELENIUM_DISABLE_DRIVER_MANAGER'] = '1'
         
-        logger.info(f"[LAMBDA] Initializing Chrome driver with ChromeDriver: {chromedriver_path}, Chrome: {chrome_binary}")
+        logger.info(f"[LAMBDA] Initializing undetected Chrome driver with ChromeDriver: {chromedriver_path}, Chrome: {chrome_binary}")
         logger.info(f"[LAMBDA] Environment: SE_SELENIUM_MANAGER={os.environ.get('SE_SELENIUM_MANAGER')}")
         
-        # Create driver with explicit paths - this should bypass SeleniumManager
-        driver = webdriver.Chrome(service=service, options=chrome_options)
+        # Use undetected-chromedriver with explicit paths
+        # undetected-chromedriver handles anti-detection automatically
+        driver = uc.Chrome(
+            options=chrome_options,
+            driver_executable_path=chromedriver_path,
+            browser_executable_path=chrome_binary,
+            use_subprocess=False,  # Important for Lambda
+            version_main=None,  # Let it auto-detect
+        )
         
-        # Wait longer for Chrome to fully initialize (don't check session immediately)
-        time.sleep(2)
+        # Wait briefly for Chrome to start (but don't verify)
+        time.sleep(3)
         
-        # Try to navigate to a blank page to verify driver works (less aggressive than current_url)
-        try:
-            driver.get("about:blank")
-            time.sleep(0.5)
-        except Exception as e:
-            logger.error(f"[LAMBDA] Chrome driver failed to navigate to blank page: {e}")
-            try:
-                driver.quit()
-            except:
-                pass
-            raise Exception("Chrome driver crashed during initialization")
-        
-        # Inject anti-detection script (non-critical)
-        try:
-            driver.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument', {
-                'source': '''
-                    Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-                '''
-            })
-        except Exception as e:
-            logger.warning(f"[LAMBDA] Could not inject anti-detection script (non-critical): {e}")
-            # Continue anyway - this is not critical
-        
-        logger.info("[LAMBDA] Chrome driver initialized successfully")
+        logger.info("[LAMBDA] Undetected Chrome driver created successfully")
         return driver
     except Exception as e:
         logger.error(f"[LAMBDA] Failed to initialize Chrome driver: {e}")
         logger.error(traceback.format_exc())
         
-        # Last resort: try with absolute minimal options
+        # Last resort: try with absolute minimal options using undetected-chromedriver
         try:
-            logger.info("[LAMBDA] Retrying with absolute minimal options...")
-            minimal_options = Options()
-            # Only the absolute essentials
+            logger.info("[LAMBDA] Retrying with absolute minimal options using undetected-chromedriver...")
+            minimal_options = uc.ChromeOptions()
+            # Only the absolute essentials - nothing more
             minimal_options.add_argument("--headless=new")
             minimal_options.add_argument("--no-sandbox")
             minimal_options.add_argument("--disable-dev-shm-usage")
             minimal_options.add_argument("--disable-gpu")
-            minimal_options.add_argument("--window-size=1280,800")
             
-            if chrome_binary:
-                minimal_options.binary_location = chrome_binary
+            # Use undetected-chromedriver with minimal options
+            driver = uc.Chrome(
+                options=minimal_options,
+                driver_executable_path=chromedriver_path,
+                browser_executable_path=chrome_binary,
+                use_subprocess=False,  # Important for Lambda
+                version_main=None,  # Let it auto-detect
+            )
             
-            # Service is already imported at the top - don't import again
-            service = Service(executable_path=chromedriver_path)
-            driver = webdriver.Chrome(service=service, options=minimal_options)
+            # Wait but DO NOT verify - verification causes crashes
+            time.sleep(3)
             
-            # Wait and verify with blank page navigation
-            time.sleep(2)
-            try:
-                driver.get("about:blank")
-                time.sleep(0.5)
-            except Exception as e:
-                logger.error(f"[LAMBDA] Minimal Chrome driver also crashed: {e}")
-                try:
-                    driver.quit()
-                except:
-                    pass
-                raise
-            
-            logger.info("[LAMBDA] Chrome driver initialized with minimal options")
+            logger.info("[LAMBDA] Undetected Chrome driver created with minimal options")
             return driver
         except Exception as e2:
             logger.error(f"[LAMBDA] Final retry also failed: {e2}")
