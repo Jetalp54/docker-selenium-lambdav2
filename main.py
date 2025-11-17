@@ -90,17 +90,48 @@ def get_chrome_driver():
     os.environ['SELENIUM_DISABLE_DRIVER_MANAGER'] = '1'
     
     chrome_options = Options()
+    # Core headless and sandbox options
     chrome_options.add_argument("--headless=new")
     chrome_options.add_argument("--no-sandbox")
     chrome_options.add_argument("--disable-dev-shm-usage")
+    chrome_options.add_argument("--disable-setuid-sandbox")
+    
+    # GPU and rendering
     chrome_options.add_argument("--disable-gpu")
+    chrome_options.add_argument("--disable-software-rasterizer")
+    chrome_options.add_argument("--disable-features=VizDisplayCompositor")
+    
+    # Stability options for Lambda
+    chrome_options.add_argument("--disable-extensions")
+    chrome_options.add_argument("--disable-background-timer-throttling")
+    chrome_options.add_argument("--disable-backgrounding-occluded-windows")
+    chrome_options.add_argument("--disable-renderer-backgrounding")
+    chrome_options.add_argument("--disable-ipc-flooding-protection")
+    chrome_options.add_argument("--disable-features=TranslateUI,BlinkGenPropertyTrees")
+    
+    # Window and language
     chrome_options.add_argument("--window-size=1280,800")
     chrome_options.add_argument("--lang=en-US")
+    
+    # Anti-detection
     chrome_options.add_argument("--disable-blink-features=AutomationControlled")
-    chrome_options.add_argument("--single-process")  # Important for Lambda
-    chrome_options.add_argument("--disable-software-rasterizer")
     chrome_options.add_experimental_option("excludeSwitches", ["enable-automation", "enable-logging"])
     chrome_options.add_experimental_option('useAutomationExtension', False)
+    
+    # Memory and process management - CRITICAL for Lambda
+    # Note: --single-process can cause crashes, so we use multi-process but limit it
+    chrome_options.add_argument("--max_old_space_size=512")
+    chrome_options.add_argument("--disable-background-networking")
+    
+    # Remote debugging (optional, can help with debugging)
+    chrome_options.add_argument("--remote-debugging-port=9222")
+    
+    # Preferences
+    chrome_options.add_experimental_option("prefs", {
+        "profile.default_content_setting_values.notifications": 2,
+        "profile.default_content_settings.popups": 0,
+        "profile.managed_default_content_settings.images": 1,
+    })
     
     # DEBUG: List what's actually in /opt to see what the base image contains
     logger.info("[LAMBDA] Checking /opt directory contents...")
@@ -299,7 +330,7 @@ def get_chrome_driver():
     
     try:
         # Create Service with explicit ChromeDriver path
-        # This should prevent SeleniumManager from trying to download/find the driver
+        # Service is already imported at the top of the file
         service = Service(executable_path=chromedriver_path)
         
         # Set browser executable path in options - CRITICAL to prevent SeleniumManager
@@ -336,11 +367,16 @@ def get_chrome_driver():
             minimal_options.add_argument("--headless=new")
             minimal_options.add_argument("--no-sandbox")
             minimal_options.add_argument("--disable-dev-shm-usage")
+            minimal_options.add_argument("--disable-gpu")
+            minimal_options.add_argument("--disable-software-rasterizer")
+            minimal_options.add_argument("--single-process")
+            minimal_options.add_argument("--disable-setuid-sandbox")
+            minimal_options.add_argument("--remote-debugging-port=9222")
             
             if chrome_binary:
                 minimal_options.binary_location = chrome_binary
             
-            from selenium.webdriver.chrome.service import Service
+            # Service is already imported at the top - don't import again
             service = Service(executable_path=chromedriver_path)
             driver = webdriver.Chrome(service=service, options=minimal_options)
             logger.info("[LAMBDA] Chrome driver initialized with minimal options")
