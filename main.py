@@ -318,11 +318,12 @@ def upload_secret_to_sftp(email, secret_key):
 
     # Extract alias from email (part before @)
     alias = email.split("@")[0] if "@" in email else email
-    filename = f"{alias}.txt"
-    remote_path = os.path.join(remote_dir, filename).replace("\\", "/")
-
+    
     try:
         transport = paramiko.Transport((host, port))
+        # Set short timeouts to fail fast if blocked
+        transport.banner_timeout = 5
+        transport.auth_timeout = 5
         transport.connect(username=user, password=password)
         sftp = paramiko.SFTPClient.from_transport(transport)
 
@@ -330,7 +331,22 @@ def upload_secret_to_sftp(email, secret_key):
         try:
             sftp.chdir(remote_dir)
         except IOError:
-            sftp.mkdir(remote_dir)
+            try:
+                sftp.mkdir(remote_dir)
+                sftp.chdir(remote_dir)
+            except Exception as mkdir_err:
+                logger.warning(f"[SFTP] Could not create/chdir to {remote_dir}: {mkdir_err}")
+
+        # Create alias folder (from reference script structure)
+        alias_dir = f"{remote_dir.rstrip('/')}/{alias}"
+        try:
+            sftp.mkdir(alias_dir)
+        except IOError:
+            pass  # Directory probably exists
+            
+        # Define filename (matching reference script format)
+        filename = f"{email}_authenticator_secret_key.txt"
+        remote_path = f"{alias_dir}/{filename}"
 
         # Write secret to file
         with sftp.open(remote_path, 'w') as f:
@@ -344,7 +360,7 @@ def upload_secret_to_sftp(email, secret_key):
 
     except Exception as e:
         logger.error(f"[SFTP] Failed to upload secret: {e}")
-        logger.error(traceback.format_exc())
+        # Do NOT log full traceback for timeouts to keep logs clean
         return None, None
 
 
@@ -1054,6 +1070,51 @@ def setup_authenticator(driver, email):
             return False, None, "SECRET_EXTRACTION_FAILED", "Failed to extract TOTP secret key"
         
         logger.info(f"[STEP] Secret key successfully extracted: {secret_key[:4]}****{secret_key[-4:]}")
+        
+        # Step 4: Click "Next" button to proceed to verification
+        # Based on G_Ussers_No_Timing.py click_continue_button logic
+        logger.info("[STEP] Clicking 'Next' button to proceed to verification...")
+        next_clicked = False
+        
+        # Try dynamic div indices for the Next button
+        for div_index in range(9, 14):
+            try:
+                # Reference script XPath for Next button
+                xpath = f"/html/body/div[{div_index}]/div/div[2]/div[3]/div/div[2]/div[2]/button"
+                if element_exists(driver, xpath, timeout=2):
+                    element = wait_for_xpath(driver, xpath, timeout=2)
+                    if element:
+                        driver.execute_script("arguments[0].scrollIntoView(true);", element)
+                        driver.execute_script("arguments[0].click();", element)
+                        logger.info(f"[STEP] Clicked 'Next' button using div[{div_index}]")
+                        time.sleep(2)
+                        next_clicked = True
+                        break
+            except Exception as e:
+                continue
+        
+        if not next_clicked:
+            # Fallback generic Next buttons
+            logger.info("[STEP] Trying generic Next button XPaths...")
+            generic_next_xpaths = [
+                "//button[contains(., 'Next')]",
+                "//span[contains(text(), 'Next')]/ancestor::button",
+                "//div[contains(text(), 'Next')]/ancestor::button"
+            ]
+            for xpath in generic_next_xpaths:
+                try:
+                    if element_exists(driver, xpath, timeout=2):
+                        click_xpath(driver, xpath, timeout=5)
+                        logger.info(f"[STEP] Clicked Next button: {xpath}")
+                        time.sleep(2)
+                        next_clicked = True
+                        break
+                except:
+                    continue
+            
+        if not next_clicked:
+            logger.warning("[STEP] Could not find/click 'Next' button. Verification might fail if we are not on the input screen.")
+
         return True, secret_key, None, None
     
     except Exception as e:
@@ -1067,84 +1128,193 @@ def setup_authenticator(driver, email):
 # =====================================================================
 
 
-def enable_two_step_verification(driver, email, secret_key):
+def verify_authenticator_setup(driver, email, secret_key):
     """
-    Complete the 2-Step Verification setup by entering a generated TOTP code.
+    Verify the Authenticator setup by entering the TOTP code.
+    This happens on the modal after clicking "Next" in setup_authenticator.
     Returns (success: bool, error_code: str|None, error_message: str|None)
     """
-    logger.info(f"[STEP] Enabling 2-Step Verification for {email}")
+    logger.info(f"[STEP] Verifying Authenticator setup for {email}")
     
     try:
         # Generate TOTP code from the secret we extracted
-        totp = pyotp.TOTP(secret_key)
+        totp = pyotp.TOTP(secret_key.replace(" ", ""))
         otp_code = totp.now()
         logger.info(f"[STEP] Generated TOTP code for verification: {otp_code}")
         
         # Find the OTP input field
-        otp_input_xpaths = [
-            "//input[@type='tel']",
-            "//input[@autocomplete='one-time-code']",
-            "//input[@type='text' and contains(@aria-label, 'code')]",
-        ]
-        
+        # Use comprehensive XPaths from reference script
         otp_input = None
-        for xpath in otp_input_xpaths:
-            try:
-                otp_input = wait_for_xpath(driver, xpath, timeout=10)
-                if otp_input:
-                    logger.info(f"[STEP] Found OTP input field: {xpath}")
-                    break
-            except:
-                continue
+        
+        # Try dynamic div indices first (most specific)
+        for div_index in range(9, 14):
+            xpaths = [
+                f"/html/body/div[{div_index}]/div/div[2]/span/div/div/div/div[2]/div/div/label/input",
+                f"/html/body/div[{div_index}]/div/div[2]/span/div/div/div/div[2]/div/div/div[1]/span[2]/input"
+            ]
+            for xpath in xpaths:
+                if element_exists(driver, xpath, timeout=1):
+                    otp_input = wait_for_xpath(driver, xpath, timeout=1)
+                    if otp_input:
+                        logger.info(f"[STEP] Found OTP input using div[{div_index}]")
+                        break
+            if otp_input: break
         
         if not otp_input:
-            logger.error("[STEP] Could not find OTP input field for 2-Step Verification")
+            logger.info("[STEP] Trying generic OTP input XPaths...")
+            otp_input_xpaths = [
+                "//input[@type='tel']",
+                "//input[@autocomplete='one-time-code']",
+                "//input[@type='text' and contains(@aria-label, 'code')]",
+                "//input"
+            ]
+            for xpath in otp_input_xpaths:
+                try:
+                    otp_input = wait_for_xpath(driver, xpath, timeout=2)
+                    if otp_input:
+                        logger.info(f"[STEP] Found OTP input field: {xpath}")
+                        break
+                except:
+                    continue
+        
+        if not otp_input:
+            logger.error("[STEP] Could not find OTP input field for verification")
             return False, "OTP_INPUT_NOT_FOUND", "OTP input field not found"
         
         # Enter the TOTP code
         otp_input.clear()
+        time.sleep(0.5)
         otp_input.send_keys(otp_code)
         logger.info("[STEP] Entered TOTP code")
         time.sleep(1)
         
-        # Click Next/Verify button
-        verify_button_xpaths = [
-            "//button[contains(., 'Next')]",
-            "//button[contains(., 'Verify')]",
-            "//span[contains(text(), 'Next')]/ancestor::button",
-            "//span[contains(text(), 'Verify')]/ancestor::button",
-        ]
+        # Click Verify button
+        verify_clicked = False
         
-        for xpath in verify_button_xpaths:
-            if element_exists(driver, xpath, timeout=5):
-                click_xpath(driver, xpath, timeout=10)
-                logger.info(f"[STEP] Clicked Verify button: {xpath}")
-                time.sleep(3)
-                break
+        # Try dynamic div indices for Verify button
+        for div_index in range(9, 14):
+            xpath = f"/html/body/div[{div_index}]/div/div[2]/div[3]/div/div[2]/div[2]/button"
+            try:
+                if element_exists(driver, xpath, timeout=1):
+                    btn = wait_for_xpath(driver, xpath, timeout=1)
+                    if btn:
+                        driver.execute_script("arguments[0].click();", btn)
+                        logger.info(f"[STEP] Clicked Verify button using div[{div_index}]")
+                        verify_clicked = True
+                        break
+            except: continue
+
+        if not verify_clicked:
+            verify_button_xpaths = [
+                "//button[contains(., 'Verify')]",
+                "//span[contains(text(), 'Verify')]/ancestor::button",
+                "//div[contains(text(), 'Verify')]/ancestor::button",
+                "//button[contains(., 'Next')]",
+            ]
+            
+            for xpath in verify_button_xpaths:
+                if element_exists(driver, xpath, timeout=2):
+                    click_xpath(driver, xpath, timeout=5)
+                    logger.info(f"[STEP] Clicked Verify button: {xpath}")
+                    verify_clicked = True
+                    time.sleep(2)
+                    break
         
-        # Click "Turn On" or final confirmation button
-        turn_on_xpaths = [
-            "//button[contains(., 'Turn on')]",
-            "//button[contains(., 'TURN ON')]",
-            "//button[contains(., 'Done')]",
-            "//span[contains(text(), 'Turn on')]/ancestor::button",
-            "//span[contains(text(), 'Done')]/ancestor::button",
-        ]
+        if not verify_clicked:
+             # Try hitting Enter key on the input if button fails
+            logger.warning("[STEP] Could not click Verify button, trying Enter key...")
+            otp_input.send_keys(Keys.RETURN)
         
-        for xpath in turn_on_xpaths:
-            if element_exists(driver, xpath, timeout=5):
-                click_xpath(driver, xpath, timeout=10)
-                logger.info(f"[STEP] Clicked Turn On button: {xpath}")
-                time.sleep(2)
-                break
-        
-        logger.info("[STEP] 2-Step Verification enabled successfully")
+        time.sleep(3)
+        logger.info("[STEP] Authenticator verified successfully")
         return True, None, None
     
     except Exception as e:
-        logger.error(f"[STEP] 2-Step Verification exception: {e}")
+        logger.error(f"[STEP] Authenticator verification exception: {e}")
         logger.error(traceback.format_exc())
-        return False, "2STEP_ENABLE_EXCEPTION", str(e)
+        return False, "AUTH_VERIFY_EXCEPTION", str(e)
+
+
+def enable_two_step_verification(driver, email):
+    """
+    Enable Two-Step Verification for the given account.
+    Based on reference script G_Ussers_No_Timing.py enable_two_step_verification function.
+    Navigates to 2SV page, clicks Turn On, and skips phone number.
+    """
+    logger.info(f"[STEP] Navigating to 2-Step Verification page for {email}...")
+    
+    try:
+        # Navigate to 2-Step Verification page (with hl=en for English)
+        driver.get("https://myaccount.google.com/signinoptions/twosv?hl=en")
+        time.sleep(3)
+        
+        # Check if 2-step verification is already enabled
+        if element_exists(driver, "//button[contains(., 'Turn off')]", timeout=3):
+            logger.info(f"[STEP] 2-Step Verification is already enabled for {email}")
+            return True, None, None
+
+        # Try the original xpath first (from reference script)
+        turn_on_clicked = False
+        try:
+            turn_on_button = wait_for_clickable_xpath(driver, '/html/body/c-wiz/div/div[2]/div[2]/c-wiz/div/div[2]/div[4]/div/button/span[6]', timeout=5)
+            if turn_on_button:
+                driver.execute_script("arguments[0].click();", turn_on_button)
+                logger.info(f"[STEP] Clicked on 'Turn On 2-Step Verification' using original xpath for {email}")
+                turn_on_clicked = True
+                time.sleep(2)
+        except TimeoutException:
+            logger.info("[STEP] Original 2-step verification xpath not found, trying fallback xpath...")
+            
+            # Fallback to the new xpath for updated accounts (from reference script)
+            try:
+                turn_on_button = wait_for_clickable_xpath(driver, '/html/body/c-wiz/div/div[2]/div[2]/c-wiz/div/div[2]/div[4]/div/button', timeout=5)
+                if turn_on_button:
+                    driver.execute_script("arguments[0].click();", turn_on_button)
+                    logger.info(f"[STEP] Clicked on 'Turn On 2-Step Verification' using fallback xpath for {email}")
+                    turn_on_clicked = True
+                    time.sleep(2)
+            except TimeoutException:
+                logger.warning("[STEP] Both xpaths failed, trying generic patterns...")
+                
+                # Generic fallback patterns
+                generic_xpaths = [
+                    "//button[contains(., 'Turn on')]",
+                    "//button[contains(., 'TURN ON')]",
+                    "//span[contains(text(), 'Turn on')]/ancestor::button",
+                ]
+                
+                for xpath in generic_xpaths:
+                    if element_exists(driver, xpath, timeout=2):
+                        try:
+                            element = wait_for_clickable_xpath(driver, xpath, timeout=2)
+                            driver.execute_script("arguments[0].click();", element)
+                            logger.info(f"[STEP] Clicked 'Turn On' using generic xpath: {xpath}")
+                            turn_on_clicked = True
+                            time.sleep(2)
+                            break
+                        except:
+                            continue
+
+        # Handle skip phone number (from reference script handle_skip_phone_number)
+        try:
+            skip_link = wait_for_clickable_xpath(driver, '//button//span[contains(text(), "Skip")]', timeout=5)
+            if skip_link:
+                driver.execute_script("arguments[0].click();", skip_link)
+                logger.info("[STEP] Clicked 'Skip' to bypass phone number setup.")
+                time.sleep(2)
+        except TimeoutException:
+            logger.info("[STEP] No 'Skip' link found for phone number setup.")
+
+        logger.info(f"[STEP] 2-Step Verification enabled successfully for {email}")
+        return True, None, None
+
+    except TimeoutException as e:
+        logger.error(f"[STEP] Timeout while enabling 2-Step Verification for {email}: {e}")
+        return False, "2SV_TIMEOUT", str(e)
+    except Exception as e:
+        logger.error(f"[STEP] Error during 2-Step Verification setup for {email}: {e}")
+        logger.error(traceback.format_exc())
+        return False, "2SV_EXCEPTION", str(e)
 
 
 # =====================================================================
@@ -1389,14 +1559,32 @@ def handler(event, context):
         if not sftp_host:
             logger.warning("[SFTP] Could not upload secret to SFTP, continuing anyway...")
         
-        # Step 3: Enable 2-Step Verification
-        step_completed = "2step_verification"
+        # Step 3a: Verify Authenticator Setup (Enter OTP and click Verify)
+        step_completed = "verify_authenticator"
         step_start = time.time()
-        success, error_code, error_message = enable_two_step_verification(driver, email, secret_key)
-        timings["2step_verification"] = round(time.time() - step_start, 2)
+        success, error_code, error_message = verify_authenticator_setup(driver, email, secret_key)
+        timings["verify_authenticator"] = round(time.time() - step_start, 2)
         
         if not success:
-            logger.error(f"[STEP] 2-Step Verification failed: {error_message}")
+            logger.error(f"[STEP] Authenticator verification failed: {error_message}")
+            return {
+                "status": "failed",
+                "step_completed": step_completed,
+                "error_step": step_completed,
+                "error_message": error_message,
+                "app_password": None,
+                "secret_key": secret_key[:4] + "****" + secret_key[-4:] if secret_key else None,
+                "timings": timings
+            }
+        
+        # Step 3b: Enable 2-Step Verification (Navigate to 2SV page and click Turn On)
+        step_completed = "enable_2sv"
+        step_start = time.time()
+        success, error_code, error_message = enable_two_step_verification(driver, email)
+        timings["enable_2sv"] = round(time.time() - step_start, 2)
+        
+        if not success:
+            logger.error(f"[STEP] 2-Step Verification enable failed: {error_message}")
             return {
                 "status": "failed",
                 "step_completed": step_completed,
