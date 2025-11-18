@@ -632,6 +632,215 @@ def append_app_password_to_s3(email, app_password):
 # =====================================================================
 
 
+def handle_post_login_pages(driver, max_attempts=20):
+    """
+    Handle all intermediate pages after login (Speedbump, verification prompts, etc.)
+    before reaching myaccount.google.com
+    Returns (success: bool, error_code: str|None, error_message: str|None)
+    """
+    logger.info("[STEP] Handling post-login pages (Speedbump, verification, etc.)")
+    
+    for attempt in range(max_attempts):
+        time.sleep(3)  # Wait between checks
+        
+        try:
+            current_url = driver.current_url
+            logger.info(f"[STEP] Post-login check {attempt + 1}/{max_attempts}: URL = {current_url}")
+            
+            # Check if we've reached myaccount
+            if "myaccount.google.com" in current_url:
+                logger.info("[STEP] Successfully reached myaccount.google.com")
+                return True, None, None
+            
+            # Handle Speedbump page (Don't now / Continue)
+            if "speedbump" in current_url or element_exists(driver, "//button[contains(., 'Continue') or contains(., 'Next')]", timeout=2):
+                logger.info("[STEP] Speedbump or confirmation page detected")
+                
+                # Try multiple button selectors for Continue/Next
+                continue_button_xpaths = [
+                    "//button[contains(., 'Continue')]",
+                    "//button[contains(., 'Next')]",
+                    "//span[contains(text(), 'Continue')]/ancestor::button",
+                    "//span[contains(text(), 'Next')]/ancestor::button",
+                    "//div[@role='button' and contains(., 'Continue')]",
+                    "//div[@role='button' and contains(., 'Next')]",
+                ]
+                
+                clicked = False
+                for xpath in continue_button_xpaths:
+                    try:
+                        if element_exists(driver, xpath, timeout=2):
+                            click_xpath(driver, xpath, timeout=5)
+                            logger.info(f"[STEP] Clicked Continue/Next button using: {xpath}")
+                            clicked = True
+                            time.sleep(2)
+                            break
+                    except Exception as e:
+                        logger.debug(f"[STEP] Could not click button with xpath {xpath}: {e}")
+                        continue
+                
+                if not clicked:
+                    logger.warning("[STEP] Could not find Continue/Next button, checking for 'Don't now' button")
+                    # Try "Don't now" or "Not now" or "Skip"
+                    skip_button_xpaths = [
+                        "//button[contains(., \"Don't now\")]",
+                        "//button[contains(., 'Not now')]",
+                        "//button[contains(., 'Skip')]",
+                        "//span[contains(text(), \"Don't now\")]/ancestor::button",
+                        "//span[contains(text(), 'Not now')]/ancestor::button",
+                        "//span[contains(text(), 'Skip')]/ancestor::button",
+                    ]
+                    
+                    for xpath in skip_button_xpaths:
+                        try:
+                            if element_exists(driver, xpath, timeout=2):
+                                click_xpath(driver, xpath, timeout=5)
+                                logger.info(f"[STEP] Clicked Skip/Don't now button using: {xpath}")
+                                time.sleep(2)
+                                break
+                        except Exception as e:
+                            logger.debug(f"[STEP] Could not click skip button with xpath {xpath}: {e}")
+                            continue
+                
+                continue  # Go to next iteration to check new page
+            
+            # Handle "Verify it's you" or recovery info pages
+            if "verify" in current_url.lower() or element_exists(driver, "//h1[contains(., 'Verify')]", timeout=2):
+                logger.info("[STEP] Verification page detected")
+                
+                # Try to click Continue/Next/Skip
+                verify_button_xpaths = [
+                    "//button[contains(., 'Continue')]",
+                    "//button[contains(., 'Next')]",
+                    "//button[contains(., 'Skip')]",
+                    "//span[contains(text(), 'Continue')]/ancestor::button",
+                    "//span[contains(text(), 'Next')]/ancestor::button",
+                    "//span[contains(text(), 'Skip')]/ancestor::button",
+                ]
+                
+                for xpath in verify_button_xpaths:
+                    try:
+                        if element_exists(driver, xpath, timeout=2):
+                            click_xpath(driver, xpath, timeout=5)
+                            logger.info(f"[STEP] Clicked verification button using: {xpath}")
+                            time.sleep(2)
+                            break
+                    except Exception as e:
+                        logger.debug(f"[STEP] Could not click verify button with xpath {xpath}: {e}")
+                        continue
+                
+                continue  # Go to next iteration
+            
+            # Handle "Add recovery email/phone" prompts
+            if "recovery" in current_url.lower() or element_exists(driver, "//h1[contains(., 'recovery') or contains(., 'Recovery')]", timeout=2):
+                logger.info("[STEP] Recovery info page detected")
+                
+                # Try to skip/not now
+                recovery_skip_xpaths = [
+                    "//button[contains(., 'Skip')]",
+                    "//button[contains(., 'Not now')]",
+                    "//button[contains(., \"Don't now\")]",
+                    "//button[contains(., 'Done')]",
+                    "//span[contains(text(), 'Skip')]/ancestor::button",
+                    "//span[contains(text(), 'Not now')]/ancestor::button",
+                    "//span[contains(text(), 'Done')]/ancestor::button",
+                ]
+                
+                for xpath in recovery_skip_xpaths:
+                    try:
+                        if element_exists(driver, xpath, timeout=2):
+                            click_xpath(driver, xpath, timeout=5)
+                            logger.info(f"[STEP] Clicked skip recovery button using: {xpath}")
+                            time.sleep(2)
+                            break
+                    except Exception as e:
+                        logger.debug(f"[STEP] Could not click recovery skip button with xpath {xpath}: {e}")
+                        continue
+                
+                continue  # Go to next iteration
+            
+            # Handle "Review account info" or similar
+            if element_exists(driver, "//h1[contains(., 'Review')]", timeout=2):
+                logger.info("[STEP] Review page detected")
+                
+                # Try to continue/next
+                review_button_xpaths = [
+                    "//button[contains(., 'Continue')]",
+                    "//button[contains(., 'Next')]",
+                    "//button[contains(., 'I agree')]",
+                    "//button[contains(., 'Agree')]",
+                    "//span[contains(text(), 'Continue')]/ancestor::button",
+                    "//span[contains(text(), 'Next')]/ancestor::button",
+                ]
+                
+                for xpath in review_button_xpaths:
+                    try:
+                        if element_exists(driver, xpath, timeout=2):
+                            click_xpath(driver, xpath, timeout=5)
+                            logger.info(f"[STEP] Clicked review button using: {xpath}")
+                            time.sleep(2)
+                            break
+                    except Exception as e:
+                        logger.debug(f"[STEP] Could not click review button with xpath {xpath}: {e}")
+                        continue
+                
+                continue  # Go to next iteration
+            
+            # If we don't recognize the page but haven't reached myaccount, try generic Continue/Next
+            if "google.com" in current_url and "myaccount" not in current_url:
+                logger.info("[STEP] Unrecognized intermediate Google page, trying generic Continue/Next")
+                
+                generic_button_xpaths = [
+                    "//button[contains(., 'Continue')]",
+                    "//button[contains(., 'Next')]",
+                    "//button[contains(., 'Done')]",
+                    "//button[contains(., 'I agree')]",
+                    "//span[contains(text(), 'Continue')]/ancestor::button",
+                    "//span[contains(text(), 'Next')]/ancestor::button",
+                    "//span[contains(text(), 'Done')]/ancestor::button",
+                ]
+                
+                found_button = False
+                for xpath in generic_button_xpaths:
+                    try:
+                        if element_exists(driver, xpath, timeout=2):
+                            click_xpath(driver, xpath, timeout=5)
+                            logger.info(f"[STEP] Clicked generic button using: {xpath}")
+                            time.sleep(2)
+                            found_button = True
+                            break
+                    except Exception as e:
+                        logger.debug(f"[STEP] Could not click generic button with xpath {xpath}: {e}")
+                        continue
+                
+                if not found_button:
+                    # No button found, just wait and check next iteration
+                    logger.info("[STEP] No recognizable button found, waiting...")
+            
+        except Exception as e:
+            logger.warning(f"[STEP] Error during post-login page handling: {e}")
+            # Continue anyway, might resolve in next iteration
+    
+    # If we've exhausted all attempts and still not on myaccount
+    try:
+        final_url = driver.current_url
+        logger.warning(f"[STEP] Did not reach myaccount.google.com after {max_attempts} attempts. Final URL: {final_url}")
+        
+        # Check if we're at least on a Google domain
+        if "google.com" in final_url:
+            logger.info("[STEP] Still on Google domain, attempting to navigate directly to myaccount")
+            driver.get("https://myaccount.google.com/")
+            time.sleep(5)
+            
+            if "myaccount.google.com" in driver.current_url:
+                logger.info("[STEP] Successfully navigated to myaccount.google.com directly")
+                return True, None, None
+        
+        return False, "POST_LOGIN_TIMEOUT", f"Could not reach myaccount.google.com. Final URL: {final_url}"
+    except Exception as e:
+        return False, "POST_LOGIN_ERROR", str(e)
+
+
 def login_google(driver, email, password, known_totp_secret=None):
     """
     Login to Google. If a 2FA code is requested and we know a TOTP secret,
@@ -1295,6 +1504,16 @@ def process_account(driver, email, password, known_totp_secret=None):
     timings["login"] = time.time() - step_start
     if not ok:
         return False, step, err_type, err_msg, secret_key, app_password, s3_bucket, s3_key, timings
+
+    # 1b. HANDLE POST-LOGIN PAGES (Speedbump, verification, etc.)
+    step = "post_login_navigation"
+    step_start = time.time()
+    ok, err_type, err_msg = handle_post_login_pages(driver, max_attempts=20)
+    timings["post_login_navigation"] = time.time() - step_start
+    if not ok:
+        return False, step, err_type, err_msg, secret_key, app_password, s3_bucket, s3_key, timings
+    
+    logger.info("[STEP] Successfully reached myaccount.google.com, proceeding to security setup")
 
     # 2. NAVIGATE SECURITY
     step = "navigation"
