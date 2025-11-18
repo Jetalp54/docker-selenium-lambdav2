@@ -419,14 +419,31 @@ def handle_post_login_pages(driver, max_attempts=20):
                 logger.info("[STEP] Successfully reached myaccount.google.com")
                 return True, None, None
             
-            # Handle Speedbump page (Don't now / Continue)
-            if "speedbump" in current_url or element_exists(driver, "//button[contains(., 'Continue') or contains(., 'Next')]", timeout=2):
-                logger.info("[STEP] Speedbump or confirmation page detected")
+            # Handle Speedbump page (especially gaplustos - Google Terms of Service)
+            if "speedbump" in current_url:
+                logger.info(f"[STEP] Speedbump page detected: {current_url}")
                 
-                # Try multiple button selectors for Continue/Next
+                # Check if it's the gaplustos page specifically
+                if "speedbump/gaplustos" in current_url:
+                    logger.info("[STEP] Google+ TOS speedbump detected, using JavaScript click...")
+                    try:
+                        # Use JavaScript to click the confirm button (more reliable)
+                        driver.execute_script("document.querySelector('#confirm').click()")
+                        logger.info("[STEP] Clicked #confirm button via JavaScript")
+                        time.sleep(2)
+                        continue  # Go to next iteration
+                    except Exception as e:
+                        logger.warning(f"[STEP] JavaScript click failed: {e}")
+                
+                # Generic speedbump or fallback handling
+                logger.info("[STEP] Attempting to click speedbump/confirmation buttons...")
+                
+                # Try multiple button selectors for Continue/Next/Confirm
                 continue_button_xpaths = [
+                    "//button[@id='confirm']",
                     "//button[contains(., 'Continue')]",
                     "//button[contains(., 'Next')]",
+                    "//button[contains(., 'I agree')]",
                     "//span[contains(text(), 'Continue')]/ancestor::button",
                     "//span[contains(text(), 'Next')]/ancestor::button",
                     "//div[@role='button' and contains(., 'Continue')]",
@@ -667,25 +684,48 @@ def login_google(driver, email, password, known_totp_secret=None):
                 logger.info("[STEP] Login success - reached account page")
                 return True, None, None
             
-            # Handle speedbump page
+            # Handle speedbump/gaplustos page (Google Terms of Service)
             if "speedbump" in current_url:
-                logger.info("[STEP] Speedbump page detected, attempting to continue...")
-                try:
-                    # Try to click continue/confirm button
-                    speedbump_xpaths = [
-                        "//button[@id='confirm']",
-                        "//button[contains(., 'Continue')]",
-                        "//button[contains(., 'Next')]",
-                        "//div[@role='button' and contains(., 'Continue')]",
-                    ]
-                    for xpath in speedbump_xpaths:
-                        if element_exists(driver, xpath, timeout=2):
-                            click_xpath(driver, xpath, timeout=5)
-                            logger.info(f"[STEP] Clicked speedbump button: {xpath}")
-                            time.sleep(2)
-                            break
-                except Exception as e:
-                    logger.warning(f"[STEP] Could not click speedbump button: {e}")
+                logger.info(f"[STEP] Speedbump page detected: {current_url}")
+                
+                # Check if it's the gaplustos page specifically
+                if "speedbump/gaplustos" in current_url:
+                    logger.info("[STEP] Google+ TOS speedbump detected, clicking confirm with JavaScript...")
+                    try:
+                        # Use JavaScript to click the confirm button (more reliable for this page)
+                        driver.execute_script("document.querySelector('#confirm').click()")
+                        logger.info("[STEP] Clicked #confirm button via JavaScript")
+                        time.sleep(2)
+                    except Exception as e:
+                        logger.warning(f"[STEP] JavaScript click failed, trying XPath: {e}")
+                        # Fallback to XPath click
+                        try:
+                            if element_exists(driver, "//button[@id='confirm']", timeout=2):
+                                click_xpath(driver, "//button[@id='confirm']", timeout=5)
+                                logger.info("[STEP] Clicked #confirm button via XPath")
+                                time.sleep(2)
+                        except Exception as e2:
+                            logger.warning(f"[STEP] XPath click also failed: {e2}")
+                else:
+                    # Generic speedbump handling
+                    logger.info("[STEP] Generic speedbump page, attempting to continue...")
+                    try:
+                        # Try to click continue/confirm button
+                        speedbump_xpaths = [
+                            "//button[@id='confirm']",
+                            "//button[contains(., 'Continue')]",
+                            "//button[contains(., 'Next')]",
+                            "//button[contains(., 'I agree')]",
+                            "//div[@role='button' and contains(., 'Continue')]",
+                        ]
+                        for xpath in speedbump_xpaths:
+                            if element_exists(driver, xpath, timeout=2):
+                                click_xpath(driver, xpath, timeout=5)
+                                logger.info(f"[STEP] Clicked speedbump button: {xpath}")
+                                time.sleep(2)
+                                break
+                    except Exception as e:
+                        logger.warning(f"[STEP] Could not click speedbump button: {e}")
                 continue
             
             # Handle 2SV required page
