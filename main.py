@@ -897,6 +897,7 @@ def login_google(driver, email, password, known_totp_secret=None):
 def setup_authenticator(driver, email):
     """
     Navigate to the authenticator setup page and extract the secret key.
+    Based on reference script G_Ussers_No_Timing.py
     Returns (success: bool, secret_key: str|None, error_code: str|None, error_message: str|None)
     """
     logger.info(f"[STEP] Setting up Authenticator for {email}")
@@ -907,91 +908,152 @@ def setup_authenticator(driver, email):
         driver.get("https://myaccount.google.com/two-step-verification/authenticator?hl=en")
         time.sleep(3)
         
-        # Check for and click "Get Started" button if present
-        get_started_xpaths = [
-            "//button[contains(., 'Get started')]",
-            "//button[contains(., 'SET UP')]",
-            "//span[contains(text(), 'Get started')]/ancestor::button",
-            "//span[contains(text(), 'SET UP')]/ancestor::button",
+        # Step 1: Click "Set up authenticator" button
+        # Try multiple XPath patterns for the setup button
+        logger.info("[STEP] Looking for 'Set up authenticator' button...")
+        setup_button_xpaths = [
+            "/html/body/c-wiz/div/div[2]/div[2]/c-wiz/div/div/div[3]/div[2]/div/div/div/button/span[5]",
+            "/html/body/c-wiz/div/div[2]/div[3]/c-wiz/div/div/div[3]/div[2]/div/div/div/button",
+            "/html/body/c-wiz/div/div[2]/div[2]/c-wiz/div/div/div[3]/div[2]/div/div/div/button",
+            "//button[contains(., 'Set up') or contains(., 'SET UP')]",
+            "//span[contains(text(), 'Set up')]/ancestor::button",
+            "//button[contains(., 'Get started') or contains(., 'GET STARTED')]",
         ]
         
-        for xpath in get_started_xpaths:
-            if element_exists(driver, xpath, timeout=5):
-                click_xpath(driver, xpath, timeout=10)
-                logger.info(f"[STEP] Clicked Get Started button: {xpath}")
-                time.sleep(2)
-                break
-        
-        # Look for device selection (Android/iPhone) - select Android as it's more common
-        android_xpaths = [
-            "//button[contains(., 'Android')]",
-            "//div[contains(text(), 'Android')]/ancestor::button",
-            "//span[contains(text(), 'Android')]/ancestor::button",
-        ]
-        
-        for xpath in android_xpaths:
-            if element_exists(driver, xpath, timeout=5):
-                click_xpath(driver, xpath, timeout=10)
-                logger.info(f"[STEP] Selected Android device: {xpath}")
-                time.sleep(2)
-                break
-        
-        # Click Next after device selection
-        next_button_xpaths = [
-            "//button[contains(., 'Next')]",
-            "//span[contains(text(), 'Next')]/ancestor::button",
-        ]
-        
-        for xpath in next_button_xpaths:
-            if element_exists(driver, xpath, timeout=5):
-                click_xpath(driver, xpath, timeout=10)
-                logger.info(f"[STEP] Clicked Next after device selection: {xpath}")
-                time.sleep(2)
-                break
-        
-        # Look for "Can't scan it?" link to get the secret key in text form
-        cant_scan_xpaths = [
-            "//button[contains(., \"Can't scan it\")]",
-            "//a[contains(., \"Can't scan it\")]",
-            "//span[contains(text(), \"Can't scan it\")]/ancestor::button",
-            "//div[contains(text(), \"Can't scan it\")]/ancestor::button",
-        ]
-        
-        for xpath in cant_scan_xpaths:
-            if element_exists(driver, xpath, timeout=5):
-                click_xpath(driver, xpath, timeout=10)
-                logger.info(f"[STEP] Clicked Can't scan it link: {xpath}")
-                time.sleep(2)
-                break
-        
-        # Extract the secret key from the page
-        secret_key_xpaths = [
-            "//div[contains(@class, 'key')]//div[contains(@class, 'value')]",
-            "//span[contains(@class, 'secret')]",
-            "//div[contains(text(), ' ') and string-length(normalize-space(text())) >= 16]",
-            "//code",
-            "//pre",
-        ]
-        
-        secret_key = None
-        for xpath in secret_key_xpaths:
+        setup_clicked = False
+        for xpath in setup_button_xpaths:
             try:
-                element = wait_for_xpath(driver, xpath, timeout=10)
+                if element_exists(driver, xpath, timeout=3):
+                    # Use JavaScript click for better reliability
+                    element = wait_for_xpath(driver, xpath, timeout=3)
+                    if element:
+                        driver.execute_script("arguments[0].click();", element)
+                        logger.info(f"[STEP] Clicked 'Set up authenticator' button using: {xpath}")
+                        time.sleep(2)
+                        setup_clicked = True
+                        break
+            except Exception as e:
+                logger.debug(f"[STEP] Could not click setup button with xpath {xpath}: {e}")
+                continue
+        
+        if not setup_clicked:
+            logger.warning("[STEP] Could not find 'Set up authenticator' button, continuing anyway...")
+        
+        # Step 2: Click "Can't scan it?" link to show text version
+        logger.info("[STEP] Looking for 'Can't scan it?' link...")
+        
+        # Build comprehensive list of XPath patterns
+        cant_scan_xpaths = [
+            "//span[contains(text(), 'Can't scan it?')]",
+            "//a[contains(text(), 'Can't scan it?')]",
+            "//button[contains(text(), 'Can't scan it?')]",
+            "//*[contains(text(), 'Can't scan it?')]",
+            "//span[contains(text(), 'Can\\'t scan it?')]",
+            "//*[contains(text(), 'Can\\'t scan it?')]",
+            "//span[contains(text(), 'cant scan')]",
+            "//*[contains(text(), 'cant scan')]",
+        ]
+        
+        # Add dynamic div paths
+        for div_index in range(9, 14):
+            cant_scan_xpaths.extend([
+                f"/html/body/div[{div_index}]/div/div[2]/span/div/div/div/div[2]/center/div/div/button/span[5]",
+                f"/html/body/div[{div_index}]/div/div[2]/span/div/div/div/div[2]/center/div/div/button/span[4]",
+                f"/html/body/div[{div_index}]/div/div[2]/span/div/div/div/div[2]/center/div/div/button/span[3]",
+                f"/html/body/div[{div_index}]/div/div[2]/span/div/div/div/div[2]/center/div/div/button",
+            ])
+        
+        # Add class-based patterns
+        cant_scan_xpaths.extend([
+            "//button[contains(@class, 'VfPpkd-LgbsSe')]//span[contains(text(), 'Can')]",
+            "//button[contains(@class, 'VfPpkd-LgbsSe')]//span[contains(text(), 'scan')]",
+        ])
+        
+        cant_scan_clicked = False
+        for xpath in cant_scan_xpaths:
+            try:
+                element = wait_for_xpath(driver, xpath, timeout=2)
+                if element:
+                    # Try JavaScript click first
+                    try:
+                        driver.execute_script("arguments[0].click();", element)
+                        logger.info(f"[STEP] Clicked 'Can't scan it?' link using JavaScript: {xpath}")
+                        time.sleep(2)
+                        cant_scan_clicked = True
+                        break
+                    except:
+                        # Fallback to regular click
+                        element.click()
+                        logger.info(f"[STEP] Clicked 'Can't scan it?' link using regular click: {xpath}")
+                        time.sleep(2)
+                        cant_scan_clicked = True
+                        break
+            except:
+                continue
+        
+        if not cant_scan_clicked:
+            logger.warning("[STEP] Could not find 'Can't scan it?' link")
+        
+        # Step 3: Extract the secret key
+        # Use the EXACT XPath pattern from the reference script
+        logger.info("[STEP] Extracting secret key...")
+        secret_key = None
+        
+        # Try the reference script's exact pattern first (most reliable)
+        for div_index in range(9, 14):
+            try:
+                # Reference script's exact XPath
+                xpath = f"/html/body/div[{div_index}]/div/div[2]/span/div/div/ol/li[2]/div/strong"
+                logger.debug(f"[STEP] Trying XPath: {xpath}")
+                element = wait_for_xpath(driver, xpath, timeout=3)
                 if element:
                     text = element.text.strip()
                     # Clean up the secret (remove spaces)
                     cleaned = text.replace(" ", "").upper()
                     if len(cleaned) >= 16:  # TOTP secrets are usually 16+ characters
                         secret_key = cleaned
-                        logger.info(f"[STEP] Extracted secret key: {secret_key[:4]}****{secret_key[-4:]}")
+                        logger.info(f"[STEP] Extracted secret key using div[{div_index}]: {secret_key[:4]}****{secret_key[-4:]}")
                         break
             except:
                 continue
+        
+        # Fallback: Try alternative XPath patterns
+        if not secret_key:
+            logger.info("[STEP] Trying alternative secret key XPaths...")
+            alternative_xpaths = [
+                "//strong[string-length(normalize-space(text())) >= 16]",
+                "//div[contains(@class, 'key')]//div[contains(@class, 'value')]",
+                "//span[contains(@class, 'secret')]",
+                "//code[string-length(normalize-space(text())) >= 16]",
+                "//pre[string-length(normalize-space(text())) >= 16]",
+            ]
+            
+            # Add more dynamic div patterns
+            for div_index in range(9, 14):
+                alternative_xpaths.extend([
+                    f"/html/body/div[{div_index}]/div/div[2]/span/div/div/ol/li[2]/div",
+                    f"/html/body/div[{div_index}]/div/div[2]/span/div/div/ol/li[2]",
+                    f"/html/body/div[{div_index}]//strong",
+                ])
+            
+            for xpath in alternative_xpaths:
+                try:
+                    element = wait_for_xpath(driver, xpath, timeout=2)
+                    if element:
+                        text = element.text.strip()
+                        cleaned = text.replace(" ", "").upper()
+                        if len(cleaned) >= 16 and cleaned.isalnum():
+                            secret_key = cleaned
+                            logger.info(f"[STEP] Extracted secret key using alternative XPath: {secret_key[:4]}****{secret_key[-4:]}")
+                            break
+                except:
+                    continue
         
         if not secret_key:
             logger.error("[STEP] Could not extract secret key from authenticator setup page")
             return False, None, "SECRET_EXTRACTION_FAILED", "Failed to extract TOTP secret key"
         
+        logger.info(f"[STEP] Secret key successfully extracted: {secret_key[:4]}****{secret_key[-4:]}")
         return True, secret_key, None, None
     
     except Exception as e:
