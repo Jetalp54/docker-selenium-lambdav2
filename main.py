@@ -1,88 +1,131 @@
-#!/usr/bin/env python3
 """
-AWS Lambda handler for Google Workspace 2-Step Verification and App Password setup.
+AWS Lambda Handler: Google Workspace Automation
+- Logs into Google account
+- Sets up 2-Step Verification with Authenticator
+- Extracts TOTP secret and saves to SFTP
+- Creates App Password
+- Appends App Password to S3
 
-Complete workflow:
-1. Login to Google account
-2. Handle post-login pages (Speedbump, verification, etc.)
-3. Navigate to myaccount.google.com
-4. Setup Authenticator App (extract TOTP secret)
-5. Save secret to SFTP server (46.101.170.250:/home/Api_Appas/)
-6. Enable 2-Step Verification
-7. Generate App Password (random name)
-8. Save App Password to S3 (app_passwords.txt)
+Usage:
+Event must contain: {"email": "...", "password": "..."}
 """
 
 import os
+import re
+import json
 import time
+import base64
+import random
+import string
 import logging
 import traceback
-import io
-import sys
+import subprocess
 
+# 3rd-party libraries
 import boto3
 import paramiko
 import pyotp
 
 from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import (
-    TimeoutException,
-    NoSuchElementException,
-    WebDriverException,
-)
+from selenium.common.exceptions import TimeoutException, NoSuchElementException, WebDriverException
 
-# Initialize logger first
+# Configure logging
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
-# Disable SeleniumManager at module load time
-os.environ['SE_SELENIUM_MANAGER'] = 'false'
-os.environ['SELENIUM_MANAGER'] = 'false'
-os.environ['SELENIUM_DISABLE_DRIVER_MANAGER'] = '1'
-
-# Patch SeleniumManager to prevent it from running
-try:
-    from selenium.webdriver.common import selenium_manager
-    original_binary_paths = selenium_manager.SeleniumManager.binary_paths
-    def patched_binary_paths(self, *args, **kwargs):
-        raise Exception("SeleniumManager is disabled in Lambda")
-    selenium_manager.SeleniumManager.binary_paths = patched_binary_paths
-    logger.info("[LAMBDA] SeleniumManager patched to prevent execution")
-except Exception as e:
-    logger.warning(f"[LAMBDA] Could not patch SeleniumManager: {e}")
-
+# =====================================================================
+# Chrome Driver Initialization for AWS Lambda (with anti-detection)
+# =====================================================================
 
 def get_chrome_driver():
     """
-    Initialize Chrome/Chromium driver optimized for Lambda environment.
-    Uses pre-installed binaries from umihico base image.
+    Initialize Selenium Chrome driver for AWS Lambda environment.
+    Uses standard Selenium with CDP-based anti-detection (Lambda-compatible).
     """
-    # Clean up any Selenium cache in /tmp
-    try:
-        import shutil
-        cache_dir = "/tmp/.cache/selenium"
-        if os.path.exists(cache_dir):
-            shutil.rmtree(cache_dir)
-            logger.info("[LAMBDA] Cleaned /tmp/.cache/selenium directory")
-    except Exception as e:
-        logger.warning(f"[LAMBDA] Could not clean /tmp cache: {e}")
-    
-    # Point all cache/temp to /tmp (Lambda's writable directory)
+    # Force environment variables to prevent SeleniumManager from trying to write to read-only FS
     os.environ['HOME'] = '/tmp'
     os.environ['XDG_CACHE_HOME'] = '/tmp/.cache'
     os.environ['SELENIUM_MANAGER_CACHE'] = '/tmp/.cache/selenium'
-    
-    # Completely disable SeleniumManager - use multiple methods
     os.environ['SE_SELENIUM_MANAGER'] = 'false'
     os.environ['SELENIUM_MANAGER'] = 'false'
     os.environ['SELENIUM_DISABLE_DRIVER_MANAGER'] = '1'
     
+    # Ensure /tmp directories exist
+    os.makedirs('/tmp/.cache/selenium', exist_ok=True)
+    
+    # Locate Chrome binary and ChromeDriver
+    logger.info("[LAMBDA] Checking /opt directory contents...")
+    chrome_binary = None
+    chromedriver_path = None
+    
+    # Log /opt contents for debugging
+    if os.path.exists('/opt'):
+        logger.info(f"[LAMBDA] Contents of /opt: {os.listdir('/opt')}")
+        if os.path.exists('/opt/chrome'):
+            logger.info(f"[LAMBDA] Contents of /opt/chrome: {os.listdir('/opt/chrome')}")
+    
+    # Common paths for Chrome binary
+    chrome_paths = [
+        '/opt/chrome/chrome',
+        '/opt/chrome/headless-chromium',
+        '/opt/chrome/chrome-wrapper',
+        '/usr/bin/chromium',
+        '/usr/bin/chromium-browser',
+        '/usr/bin/google-chrome',
+    ]
+    
+    for path in chrome_paths:
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            chrome_binary = path
+            logger.info(f"[LAMBDA] Found Chrome binary at: {chrome_binary}")
+            break
+    
+    # If not found by direct paths, try using 'which'
+    if not chrome_binary:
+        try:
+            result = subprocess.run(['which', 'chrome'], capture_output=True, text=True)
+            if result.returncode == 0:
+                chrome_binary = result.stdout.strip()
+                logger.info(f"[LAMBDA] Found Chrome via which: {chrome_binary}")
+        except Exception as e:
+            logger.debug(f"[LAMBDA] 'which chrome' failed: {e}")
+    
+    if not chrome_binary:
+        logger.error("[LAMBDA] Chrome binary not found! Cannot proceed without Chrome binary path.")
+        raise Exception("Chrome binary not found in Lambda environment")
+    
+    # Common paths for ChromeDriver
+    chromedriver_paths = [
+        '/opt/chromedriver',
+        '/usr/bin/chromedriver',
+        '/usr/local/bin/chromedriver',
+    ]
+    
+    for path in chromedriver_paths:
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            chromedriver_path = path
+            logger.info(f"[LAMBDA] Found ChromeDriver at: {chromedriver_path}")
+            break
+    
+    if not chromedriver_path:
+        try:
+            result = subprocess.run(['which', 'chromedriver'], capture_output=True, text=True)
+            if result.returncode == 0:
+                chromedriver_path = result.stdout.strip()
+                logger.info(f"[LAMBDA] Found ChromeDriver via which: {chromedriver_path}")
+        except Exception as e:
+            logger.debug(f"[LAMBDA] 'which chromedriver' failed: {e}")
+    
+    if not chromedriver_path:
+        logger.error("[LAMBDA] ChromeDriver not found! This should not happen with umihico base image.")
+        raise Exception("ChromeDriver not found in Lambda environment")
+
     # Use Selenium Chrome options with anti-detection
     chrome_options = Options()
     
@@ -115,107 +158,7 @@ def get_chrome_driver():
         "profile.default_content_setting_values.notifications": 2,
         "profile.default_content_settings.popups": 0,
     })
-    
-    # DEBUG: List what's actually in /opt to see what the base image contains
-    logger.info("[LAMBDA] Checking /opt directory contents...")
-    try:
-        if os.path.exists('/opt'):
-            opt_contents = os.listdir('/opt')
-            logger.info(f"[LAMBDA] Contents of /opt: {opt_contents}")
-            
-            if os.path.exists('/opt/chrome'):
-                chrome_contents = os.listdir('/opt/chrome')
-                logger.info(f"[LAMBDA] Contents of /opt/chrome: {chrome_contents}")
-    except Exception as e:
-        logger.warning(f"[LAMBDA] Could not list /opt: {e}")
-    
-    # Find Chrome binary - check common Lambda paths
-    chrome_binary_paths = [
-        '/opt/chrome/chrome',
-        '/opt/chrome/headless-chromium',
-        '/opt/google/chrome/chrome',
-        '/usr/bin/chromium-browser',
-        '/usr/bin/chromium',
-        '/usr/bin/google-chrome',
-    ]
-    
-    chrome_binary = None
-    for path in chrome_binary_paths:
-        if os.path.exists(path) and os.access(path, os.X_OK):
-            chrome_binary = path
-            logger.info(f"[LAMBDA] Found Chrome binary at: {chrome_binary}")
-            break
-    
-    # Fallback: try 'which' command
-    if not chrome_binary:
-        logger.warning("[LAMBDA] Chrome not found in common paths, trying 'which'...")
-        try:
-            import subprocess
-            result = subprocess.run(['which', 'chrome'], capture_output=True, text=True, timeout=5)
-            if result.returncode == 0 and result.stdout.strip():
-                chrome_binary = result.stdout.strip()
-                logger.info(f"[LAMBDA] Found Chrome via 'which': {chrome_binary}")
-        except Exception as e:
-            logger.warning(f"[LAMBDA] 'which chrome' failed: {e}")
-    
-    # Last resort: search /opt recursively
-    if not chrome_binary:
-        logger.warning("[LAMBDA] Searching /opt recursively for Chrome...")
-        try:
-            for root, dirs, files in os.walk('/opt'):
-                for file in files:
-                    if file in ['chrome', 'chromium', 'google-chrome', 'headless-chromium']:
-                        full_path = os.path.join(root, file)
-                        if os.access(full_path, os.X_OK):
-                            chrome_binary = full_path
-                            logger.info(f"[LAMBDA] Found Chrome via recursive search: {chrome_binary}")
-                            break
-                if chrome_binary:
-                    break
-        except Exception as e:
-            logger.warning(f"[LAMBDA] Could not walk /opt: {e}")
-    
-    if not chrome_binary:
-        # List contents for debugging
-        logger.error("[LAMBDA] Chrome binary not found! Listing /opt contents for debugging:")
-        try:
-            for root, dirs, files in os.walk('/opt'):
-                logger.error(f"[LAMBDA] {root}: dirs={dirs}, files={files[:10]}")
-        except Exception as e:
-            logger.warning(f"[LAMBDA] Could not walk /opt: {e}")
-        
-        raise Exception("Chrome binary not found! Cannot proceed without Chrome binary path. Checked paths: " + str(chrome_binary_paths))
-    
-    # Find ChromeDriver - check common Lambda paths
-    chromedriver_paths = [
-        '/opt/chromedriver',
-        '/usr/bin/chromedriver',
-        '/usr/local/bin/chromedriver',
-    ]
-    
-    chromedriver_path = None
-    for path in chromedriver_paths:
-        if os.path.exists(path) and os.access(path, os.X_OK):
-            chromedriver_path = path
-            logger.info(f"[LAMBDA] Found ChromeDriver at: {chromedriver_path}")
-            break
-    
-    # Fallback: try 'which' command
-    if not chromedriver_path:
-        logger.warning("[LAMBDA] ChromeDriver not found in common paths, trying 'which'...")
-        try:
-            import subprocess
-            result = subprocess.run(['which', 'chromedriver'], capture_output=True, text=True, timeout=5)
-            if result.returncode == 0 and result.stdout.strip():
-                chromedriver_path = result.stdout.strip()
-                logger.info(f"[LAMBDA] Found ChromeDriver via 'which': {chromedriver_path}")
-        except Exception as e:
-            logger.warning(f"[LAMBDA] 'which chromedriver' failed: {e}")
-    
-    if not chromedriver_path:
-        logger.warning("[LAMBDA] ChromeDriver path not found, using PATH")
-        chromedriver_path = "chromedriver"
-    
+
     try:
         # Create Service with explicit ChromeDriver path
         service = Service(executable_path=chromedriver_path)
@@ -292,33 +235,41 @@ def get_chrome_driver():
 
 
 # =====================================================================
-# Helper functions for Selenium
+# Selenium Helper Functions
 # =====================================================================
 
-
-def wait_for_xpath(driver, xpath, timeout=20):
+def wait_for_xpath(driver, xpath, timeout=30):
     """Wait for an element by XPath and return it."""
-    return WebDriverWait(driver, timeout).until(
-        EC.presence_of_element_located((By.XPATH, xpath))
-    )
+    try:
+        element = WebDriverWait(driver, timeout).until(
+            EC.presence_of_element_located((By.XPATH, xpath))
+        )
+        return element
+    except TimeoutException:
+        logger.error(f"[SELENIUM] Timeout waiting for XPath: {xpath}")
+        return None
 
-
-def wait_for_clickable_xpath(driver, xpath, timeout=20):
+def wait_for_clickable_xpath(driver, xpath, timeout=30):
     """Wait for an element to be clickable and return it."""
-    return WebDriverWait(driver, timeout).until(
-        EC.element_to_be_clickable((By.XPATH, xpath))
-    )
+    try:
+        element = WebDriverWait(driver, timeout).until(
+            EC.element_to_be_clickable((By.XPATH, xpath))
+        )
+        return element
+    except TimeoutException:
+        logger.error(f"[SELENIUM] Timeout waiting for clickable XPath: {xpath}")
+        return None
 
+def click_xpath(driver, xpath, timeout=30):
+    """Click an element by XPath."""
+    element = wait_for_clickable_xpath(driver, xpath, timeout=timeout)
+    if element:
+        element.click()
+        return True
+    return False
 
-def click_xpath(driver, xpath, timeout=20):
-    """Wait for element to be clickable and click it."""
-    element = wait_for_clickable_xpath(driver, xpath, timeout)
-    element.click()
-    return element
-
-
-def element_exists(driver, xpath, timeout=5):
-    """Check if element exists (returns True/False, doesn't raise)."""
+def element_exists(driver, xpath, timeout=10):
+    """Check if an element exists without throwing exception."""
     try:
         WebDriverWait(driver, timeout).until(
             EC.presence_of_element_located((By.XPATH, xpath))
@@ -327,76 +278,58 @@ def element_exists(driver, xpath, timeout=5):
     except TimeoutException:
         return False
 
-
-def find_element_with_fallback(driver, xpaths, timeout=20, description="element"):
-    """
-    Try multiple XPath expressions to find an element.
-    Returns the first found element or None.
-    """
-    for xpath in xpaths:
+def find_element_with_fallback(driver, xpath_list, timeout=30, description="element"):
+    """Try multiple XPaths and return the first found element."""
+    for xpath in xpath_list:
         try:
-            elem = wait_for_xpath(driver, xpath, timeout=timeout)
-            if elem:
+            element = wait_for_xpath(driver, xpath, timeout=timeout)
+            if element:
                 logger.info(f"[STEP] Found {description} using xpath: {xpath}")
-                return elem
-        except TimeoutException:
+                return element
+        except:
             continue
-    logger.warning(f"[STEP] Could not find {description} with any of the provided xpaths")
+    logger.error(f"[STEP] Could not find {description} with any of the provided xpaths")
     return None
 
 
 # =====================================================================
-# SFTP upload for TOTP secret
+# SFTP upload for TOTP secrets
 # =====================================================================
-
 
 def upload_secret_to_sftp(email, secret_key):
     """
-    Upload the secret key to an SFTP server.
-    Environment vars needed:
-      SECRET_SFTP_HOST
+    Upload the TOTP secret key to SFTP server.
+    Environment vars:
+      SECRET_SFTP_HOST         (required)
+      SECRET_SFTP_USER         (required)
+      SECRET_SFTP_PASSWORD     (required)
       SECRET_SFTP_PORT         (optional, default 22)
-      SECRET_SFTP_USER
-      SECRET_SFTP_PASSWORD     (OR SECRET_SFTP_KEY for private key content)
-      SECRET_SFTP_REMOTE_DIR   (directory to store secrets)
+      SECRET_SFTP_REMOTE_DIR   (optional, default /root/gw_secrets)
     """
     host = os.environ.get("SECRET_SFTP_HOST", "46.101.170.250")
-    user = os.environ.get("SECRET_SFTP_USER")
-    remote_dir = os.environ.get("SECRET_SFTP_REMOTE_DIR", "/home/Api_Appas/")
     port = int(os.environ.get("SECRET_SFTP_PORT", "22"))
+    user = os.environ.get("SECRET_SFTP_USER")
     password = os.environ.get("SECRET_SFTP_PASSWORD")
-    key_content = os.environ.get("SECRET_SFTP_KEY")
+    remote_dir = os.environ.get("SECRET_SFTP_REMOTE_DIR", "/home/Api_Appas/")
 
-    if not host or not user:
-        logger.warning("SFTP parameters not fully configured (SECRET_SFTP_HOST / SECRET_SFTP_USER).")
+    if not all([host, user, password]):
+        logger.error("[SFTP] Missing SFTP credentials in environment.")
         return None, None
 
+    # Extract alias from email (part before @)
+    alias = email.split("@")[0] if "@" in email else email
+    filename = f"{alias}.txt"
+    remote_path = os.path.join(remote_dir, filename).replace("\\", "/")
+
     try:
-        # Create filename based on email
-        safe_email = email.replace("@", "_at_").replace(".", "_")
-        remote_filename = f"{safe_email}_secret.txt"
-        remote_path = os.path.join(remote_dir, remote_filename).replace("\\", "/")
-
         transport = paramiko.Transport((host, port))
-        
-        # Authenticate with password or key
-        if password:
-            transport.connect(username=user, password=password)
-        elif key_content:
-            key_file = io.StringIO(key_content)
-            pkey = paramiko.RSAKey.from_private_key(key_file)
-            transport.connect(username=user, pkey=pkey)
-        else:
-            logger.error("No SFTP password or key provided.")
-            return None, None
-
+        transport.connect(username=user, password=password)
         sftp = paramiko.SFTPClient.from_transport(transport)
-        
-        # Ensure remote directory exists
+
+        # Create remote directory if it doesn't exist
         try:
-            sftp.stat(remote_dir)
+            sftp.chdir(remote_dir)
         except IOError:
-            logger.info(f"[SFTP] Creating remote directory: {remote_dir}")
             sftp.mkdir(remote_dir)
 
         # Write secret to file
@@ -547,138 +480,94 @@ def handle_post_login_pages(driver, max_attempts=20):
                     "//button[contains(., 'Continue')]",
                     "//button[contains(., 'Next')]",
                     "//button[contains(., 'Skip')]",
+                    "//button[contains(., 'Not now')]",
                     "//span[contains(text(), 'Continue')]/ancestor::button",
                     "//span[contains(text(), 'Next')]/ancestor::button",
-                    "//span[contains(text(), 'Skip')]/ancestor::button",
                 ]
                 
                 for xpath in verify_button_xpaths:
                     try:
                         if element_exists(driver, xpath, timeout=2):
                             click_xpath(driver, xpath, timeout=5)
-                            logger.info(f"[STEP] Clicked verification button using: {xpath}")
+                            logger.info(f"[STEP] Clicked button on verification page: {xpath}")
                             time.sleep(2)
                             break
                     except Exception as e:
-                        logger.debug(f"[STEP] Could not click verify button with xpath {xpath}: {e}")
+                        logger.debug(f"[STEP] Could not click verification button with xpath {xpath}: {e}")
                         continue
                 
-                continue  # Go to next iteration
+                continue
             
-            # Handle "Add recovery email/phone" prompts
-            if "recovery" in current_url.lower() or element_exists(driver, "//h1[contains(., 'recovery') or contains(., 'Recovery')]", timeout=2):
-                logger.info("[STEP] Recovery info page detected")
-                
-                # Try to skip/not now
-                recovery_skip_xpaths = [
-                    "//button[contains(., 'Skip')]",
-                    "//button[contains(., 'Not now')]",
-                    "//button[contains(., \"Don't now\")]",
-                    "//button[contains(., 'Done')]",
-                    "//span[contains(text(), 'Skip')]/ancestor::button",
-                    "//span[contains(text(), 'Not now')]/ancestor::button",
-                    "//span[contains(text(), 'Done')]/ancestor::button",
-                ]
-                
-                for xpath in recovery_skip_xpaths:
-                    try:
-                        if element_exists(driver, xpath, timeout=2):
-                            click_xpath(driver, xpath, timeout=5)
-                            logger.info(f"[STEP] Clicked skip recovery button using: {xpath}")
-                            time.sleep(2)
-                            break
-                    except Exception as e:
-                        logger.debug(f"[STEP] Could not click recovery skip button with xpath {xpath}: {e}")
-                        continue
-                
-                continue  # Go to next iteration
-            
-            # Handle "Review account info" or similar
+            # Handle "Review your account info" or similar pages
             if element_exists(driver, "//h1[contains(., 'Review')]", timeout=2):
                 logger.info("[STEP] Review page detected")
                 
-                # Try to continue/next
                 review_button_xpaths = [
+                    "//button[contains(., 'Done')]",
                     "//button[contains(., 'Continue')]",
-                    "//button[contains(., 'Next')]",
                     "//button[contains(., 'I agree')]",
-                    "//button[contains(., 'Agree')]",
-                    "//span[contains(text(), 'Continue')]/ancestor::button",
-                    "//span[contains(text(), 'Next')]/ancestor::button",
+                    "//span[contains(text(), 'Done')]/ancestor::button",
                 ]
                 
                 for xpath in review_button_xpaths:
                     try:
                         if element_exists(driver, xpath, timeout=2):
                             click_xpath(driver, xpath, timeout=5)
-                            logger.info(f"[STEP] Clicked review button using: {xpath}")
+                            logger.info(f"[STEP] Clicked button on review page: {xpath}")
                             time.sleep(2)
                             break
                     except Exception as e:
                         logger.debug(f"[STEP] Could not click review button with xpath {xpath}: {e}")
                         continue
                 
-                continue  # Go to next iteration
+                continue
             
-            # If we don't recognize the page but haven't reached myaccount, try generic Continue/Next
-            if "google.com" in current_url and "myaccount" not in current_url:
-                logger.info("[STEP] Unrecognized intermediate Google page, trying generic Continue/Next")
-                
-                generic_button_xpaths = [
-                    "//button[contains(., 'Continue')]",
-                    "//button[contains(., 'Next')]",
-                    "//button[contains(., 'Done')]",
-                    "//button[contains(., 'I agree')]",
-                    "//span[contains(text(), 'Continue')]/ancestor::button",
-                    "//span[contains(text(), 'Next')]/ancestor::button",
-                    "//span[contains(text(), 'Done')]/ancestor::button",
-                ]
-                
-                found_button = False
-                for xpath in generic_button_xpaths:
-                    try:
-                        if element_exists(driver, xpath, timeout=2):
-                            click_xpath(driver, xpath, timeout=5)
-                            logger.info(f"[STEP] Clicked generic button using: {xpath}")
-                            time.sleep(2)
-                            found_button = True
-                            break
-                    except Exception as e:
-                        logger.debug(f"[STEP] Could not click generic button with xpath {xpath}: {e}")
-                        continue
-                
-                if not found_button:
-                    # No button found, just wait and check next iteration
-                    logger.info("[STEP] No recognizable button found, waiting...")
+            # Generic prompt handling - look for any Continue/Next/Done/Skip buttons
+            generic_button_xpaths = [
+                "//button[contains(., 'Continue')]",
+                "//button[contains(., 'Next')]",
+                "//button[contains(., 'Done')]",
+                "//button[contains(., 'Skip')]",
+                "//button[contains(., 'Not now')]",
+                "//button[contains(., 'I agree')]",
+            ]
             
+            for xpath in generic_button_xpaths:
+                try:
+                    if element_exists(driver, xpath, timeout=2):
+                        click_xpath(driver, xpath, timeout=5)
+                        logger.info(f"[STEP] Clicked generic button: {xpath}")
+                        time.sleep(2)
+                        break  # Found and clicked a button, check new page
+                except Exception as e:
+                    logger.debug(f"[STEP] Could not click generic button with xpath {xpath}: {e}")
+                    continue
+            
+            # If we're still not at myaccount after trying all buttons, try direct navigation
+            if attempt >= max_attempts - 3:  # Last 3 attempts
+                logger.warning(f"[STEP] Stuck on intermediate page, attempting direct navigation (attempt {attempt + 1})")
+                try:
+                    driver.get("https://myaccount.google.com/")
+                    time.sleep(3)
+                except Exception as e:
+                    logger.error(f"[STEP] Direct navigation failed: {e}")
+        
         except Exception as e:
-            logger.warning(f"[STEP] Error during post-login page handling: {e}")
-            # Continue anyway, might resolve in next iteration
+            logger.error(f"[STEP] Error handling post-login pages: {e}")
+            logger.error(traceback.format_exc())
     
-    # If we've exhausted all attempts and still not on myaccount
-    try:
-        final_url = driver.current_url
-        logger.warning(f"[STEP] Did not reach myaccount.google.com after {max_attempts} attempts. Final URL: {final_url}")
-        
-        # Check if we're at least on a Google domain
-        if "google.com" in final_url:
-            logger.info("[STEP] Still on Google domain, attempting to navigate directly to myaccount")
-            driver.get("https://myaccount.google.com/")
-            time.sleep(5)
-            
-            if "myaccount.google.com" in driver.current_url:
-                logger.info("[STEP] Successfully navigated to myaccount.google.com directly")
-                return True, None, None
-        
-        return False, "POST_LOGIN_TIMEOUT", f"Could not reach myaccount.google.com. Final URL: {final_url}"
-    except Exception as e:
-        return False, "POST_LOGIN_ERROR", str(e)
+    # If we've exhausted all attempts
+    current_url = driver.current_url
+    logger.error(f"[STEP] Failed to reach myaccount.google.com after {max_attempts} attempts. Last URL: {current_url}")
+    return False, "POST_LOGIN_TIMEOUT", f"Could not bypass intermediate pages. Last URL: {current_url}"
 
 
 def login_google(driver, email, password, known_totp_secret=None):
     """
     Login to Google. If a 2FA code is requested and we know a TOTP secret,
     we will try to solve it; otherwise we fail with an explicit error.
+    
+    Enhanced to handle challenge/pwd and other intermediate pages.
     """
     logger.info(f"[STEP] Login started for {email}")
     
@@ -752,8 +641,10 @@ def login_google(driver, email, password, known_totp_secret=None):
             password_input.send_keys(Keys.RETURN)
         logger.info("[STEP] Password submitted")
 
-        # Wait for potential challenge pages or account home
-        max_wait_attempts = 15
+        # Wait for potential challenge pages, intermediate pages, or account home
+        # Google may show: speedbump, verification, phone prompt, TOTP, recovery email, etc.
+        # We'll wait longer and handle what we can, skip what we can't
+        max_wait_attempts = 30  # Increased from 15 to 30 (90 seconds total)
         wait_interval = 3
         current_url = None
         
@@ -761,7 +652,7 @@ def login_google(driver, email, password, known_totp_secret=None):
             time.sleep(wait_interval)
             try:
                 current_url = driver.current_url
-                logger.info(f"[STEP] Check {attempt + 1}/{max_wait_attempts}: URL = {current_url}")
+                logger.info(f"[STEP] Post-login check {attempt + 1}/{max_wait_attempts}: URL = {current_url}")
             except Exception as e:
                 logger.error(f"[STEP] Failed to get current URL: {e}")
                 return False, "driver_crashed", f"Driver crashed while checking URL: {e}"
@@ -771,703 +662,711 @@ def login_google(driver, email, password, known_totp_secret=None):
                 logger.error("[STEP] ID verification required - manual intervention needed")
                 return False, "ID_VERIFICATION_REQUIRED", "Manual ID verification required"
             
-            # If we're logged in, return success
+            # Success conditions - we're logged in
             if any(domain in current_url for domain in ["myaccount.google.com", "mail.google.com", "accounts.google.com/b/0", "accounts.google.com/servicelogin"]):
                 logger.info("[STEP] Login success - reached account page")
                 return True, None, None
             
-            # Check for various challenge types
-            challenge_indicators = [
-                "challenge" in current_url,
-                "signin/challenge" in current_url,
-                element_exists(driver, "//input[@type='tel' or @autocomplete='one-time-code']", timeout=5),
-                element_exists(driver, "//input[contains(@aria-label, 'code') or contains(@aria-label, 'Code')]", timeout=5),
-                element_exists(driver, "//div[contains(text(), 'Enter the code') or contains(text(), 'verification code')]", timeout=5),
-            ]
-            
-            if any(challenge_indicators):
-                logger.info(f"[STEP] Challenge page detected (attempt {attempt + 1})")
-                break
-            
-            # If no challenge detected and not logged in, continue waiting
-            if attempt < max_wait_attempts - 1:
-                logger.info(f"[STEP] Waiting for page to load... ({attempt + 1}/{max_wait_attempts})")
-        
-        # Handle challenge page if detected
-        if current_url and ("challenge" in current_url or "signin/challenge" in current_url or any(challenge_indicators)):
-            logger.info("[STEP] Processing challenge page")
-            
-            # Check if it's a TOTP challenge (we can handle) or other challenge (phone, etc.)
-            otp_input_xpaths = [
-                "//input[@type='tel']",
-                "//input[@autocomplete='one-time-code']",
-                "//input[@type='text' and contains(@aria-label, 'code')]",
-                "//input[contains(@aria-label, 'Code')]",
-            ]
-            
-            otp_input = None
-            for xpath in otp_input_xpaths:
+            # Handle speedbump page
+            if "speedbump" in current_url:
+                logger.info("[STEP] Speedbump page detected, attempting to continue...")
                 try:
-                    otp_input = wait_for_xpath(driver, xpath, timeout=15)
-                    if otp_input:
-                        break
-                except:
-                    continue
-            
-            if otp_input:
-                # It's a TOTP challenge - handle it with retries
-                logger.info("[STEP] TOTP challenge detected")
-                if not known_totp_secret:
-                    logger.error("[STEP] 2FA is required but no TOTP secret is available")
-                    return False, "2FA_REQUIRED", "2FA required but secret is unknown"
-                
-                # Generate TOTP code with retries
-                otp_code = None
-                totp = None
-                for retry in range(3):
-                    try:
-                        clean_secret = known_totp_secret.replace(" ", "").upper()
-                        totp = pyotp.TOTP(clean_secret)
-                        otp_code = totp.now()
-                        logger.info(f"[STEP] Generated TOTP code (attempt {retry + 1}): {otp_code}")
-                        break
-                    except Exception as e:
-                        logger.warning(f"[STEP] TOTP generation failed (attempt {retry + 1}): {e}")
-                        if retry < 2:
-                            time.sleep(1)
-                        else:
-                            return False, "TOTP_GENERATION_FAILED", str(e)
-                
-                # Fill and submit OTP with retries
-                for retry in range(3):
-                    try:
-                        # Clear and set OTP value
-                        driver.execute_script("arguments[0].value = '';", otp_input)
-                        driver.execute_script("arguments[0].value = arguments[1];", otp_input, otp_code)
-                        logger.info(f"[STEP] OTP code entered (attempt {retry + 1}): {otp_code}")
-                        
-                        # Submit OTP
-                        submit_btn_xpaths = [
-                            "//button[contains(@type,'submit')]",
-                            "//button[@role='button' and contains(., 'Next')]",
-                            "//span[contains(text(), 'Next')]/ancestor::button",
-                            "//button[contains(., 'Verify')]",
-                        ]
-                        
-                        submitted = False
-                        for btn_xpath in submit_btn_xpaths:
-                            if element_exists(driver, btn_xpath, timeout=5):
-                                click_xpath(driver, btn_xpath, timeout=10)
-                                submitted = True
-                                break
-                        
-                        if not submitted:
-                            otp_input.send_keys(Keys.RETURN)
-                        
-                        # Wait and check result
-                        time.sleep(5)
-                        current_url = driver.current_url
-                        
-                        # Check if login succeeded
-                        if any(domain in current_url for domain in ["myaccount.google.com", "mail.google.com", "accounts.google.com/b/0"]):
-                            logger.info("[STEP] Login success after 2FA")
-                            return True, None, None
-                        
-                        # If still on challenge page, might need new code
-                        if "challenge" in current_url:
-                            if retry < 2:
-                                logger.warning(f"[STEP] Still on challenge page, retrying with new code (attempt {retry + 1})")
-                                try:
-                                    otp_code = totp.now()
-                                except:
-                                    pass
-                                time.sleep(2)
-                                continue
-                            else:
-                                return False, "2FA_VERIFICATION_FAILED", "OTP submitted but verification failed after 3 attempts"
-                        else:
-                            # Different page - might be success
-                            logger.info(f"[STEP] Navigated to different page: {current_url}")
-                            break
-                            
-                    except Exception as e:
-                        logger.error(f"[STEP] Failed to submit 2FA code (attempt {retry + 1}): {e}")
-                        if retry < 2:
+                    # Try to click continue/confirm button
+                    speedbump_xpaths = [
+                        "//button[@id='confirm']",
+                        "//button[contains(., 'Continue')]",
+                        "//button[contains(., 'Next')]",
+                        "//div[@role='button' and contains(., 'Continue')]",
+                    ]
+                    for xpath in speedbump_xpaths:
+                        if element_exists(driver, xpath, timeout=2):
+                            click_xpath(driver, xpath, timeout=5)
+                            logger.info(f"[STEP] Clicked speedbump button: {xpath}")
                             time.sleep(2)
-                        else:
-                            return False, "2FA_SUBMIT_FAILED", str(e)
+                            break
+                except Exception as e:
+                    logger.warning(f"[STEP] Could not click speedbump button: {e}")
+                continue
+            
+            # Handle 2SV required page
+            if "twosvrequired" in current_url:
+                logger.info("[STEP] Two-step verification required page detected, navigating to setup...")
+                try:
+                    driver.get("https://myaccount.google.com/two-step-verification/authenticator?hl=en")
+                    time.sleep(2)
+                except Exception as e:
+                    logger.warning(f"[STEP] Could not navigate from twosvrequired: {e}")
+                continue
+            
+            # Handle challenge pages (TOTP, phone, recovery, etc.)
+            if "challenge" in current_url or "signin/challenge" in current_url:
+                logger.info(f"[STEP] Challenge page detected: {current_url}")
                 
-                # Final check
-                time.sleep(2)
-                current_url = driver.current_url
-                if any(domain in current_url for domain in ["myaccount.google.com", "mail.google.com", "accounts.google.com/b/0"]):
-                    logger.info("[STEP] Login success after 2FA (final check)")
-                    return True, None, None
-                else:
-                    return False, "2FA_VERIFICATION_FAILED", f"OTP submitted but still on: {current_url}"
-            else:
-                # Other challenge type (phone verification, etc.) - cannot handle automatically
-                logger.error(f"[STEP] Unsupported challenge type detected on: {current_url}")
-                return False, "UNSUPPORTED_CHALLENGE", f"Challenge page detected but not TOTP: {current_url}"
+                # Check if it's challenge/pwd - this usually means additional verification
+                if "challenge/pwd" in current_url:
+                    logger.info("[STEP] Password challenge page detected - looking for continue buttons...")
+                    
+                    # Try to find and click any continue/next/skip buttons
+                    continue_xpaths = [
+                        "//button[contains(., 'Continue')]",
+                        "//button[contains(., 'Next')]",
+                        "//button[contains(., 'Skip')]",
+                        "//button[contains(., 'Not now')]",
+                        "//button[contains(., 'Done')]",
+                        "//span[contains(text(), 'Continue')]/ancestor::button",
+                        "//span[contains(text(), 'Next')]/ancestor::button",
+                        "//span[contains(text(), 'Skip')]/ancestor::button",
+                        "//div[@role='button' and contains(., 'Continue')]",
+                        "//div[@role='button' and contains(., 'Next')]",
+                    ]
+                    
+                    clicked = False
+                    for xpath in continue_xpaths:
+                        try:
+                            if element_exists(driver, xpath, timeout=2):
+                                click_xpath(driver, xpath, timeout=5)
+                                logger.info(f"[STEP] Clicked button on challenge/pwd page: {xpath}")
+                                clicked = True
+                                time.sleep(2)
+                                break
+                        except Exception as e:
+                            logger.debug(f"[STEP] Could not click xpath {xpath}: {e}")
+                            continue
+                    
+                    if clicked:
+                        continue  # Go to next iteration to check new page
+                    else:
+                        # No button found - try to navigate directly to myaccount
+                        logger.info("[STEP] No actionable button found on challenge/pwd, attempting direct navigation...")
+                        try:
+                            driver.get("https://myaccount.google.com/")
+                            time.sleep(3)
+                            continue
+                        except Exception as e:
+                            logger.warning(f"[STEP] Direct navigation failed: {e}")
+                
+                # Check if it's a TOTP challenge (we can handle this)
+                if "challenge/totp" in current_url:
+                    logger.info("[STEP] TOTP challenge detected")
+                    
+                    # Check for OTP input field
+                    otp_input_xpaths = [
+                        "//input[@type='tel']",
+                        "//input[@autocomplete='one-time-code']",
+                        "//input[@type='text' and contains(@aria-label, 'code')]",
+                        "//input[contains(@aria-label, 'Code')]",
+                    ]
+                    
+                    otp_input = None
+                    for xpath in otp_input_xpaths:
+                        try:
+                            otp_input = wait_for_xpath(driver, xpath, timeout=5)
+                            if otp_input:
+                                break
+                        except:
+                            continue
+                    
+                    if otp_input:
+                        if not known_totp_secret:
+                            logger.error("[STEP] 2FA is required but no TOTP secret is available")
+                            return False, "2FA_REQUIRED", "2FA required but secret is unknown"
+                        
+                        # Generate and submit TOTP code with retries
+                        for retry in range(3):
+                            try:
+                                # Generate fresh TOTP code
+                                clean_secret = known_totp_secret.replace(" ", "").upper()
+                                totp = pyotp.TOTP(clean_secret)
+                                otp_code = totp.now()
+                                logger.info(f"[STEP] Generated TOTP code (attempt {retry + 1}): {otp_code}")
+                                
+                                # Clear and enter OTP
+                                driver.execute_script("arguments[0].value = '';", otp_input)
+                                driver.execute_script("arguments[0].value = arguments[1];", otp_input, otp_code)
+                                logger.info(f"[STEP] OTP code entered (attempt {retry + 1})")
+                                
+                                # Submit OTP
+                                submit_btn_xpaths = [
+                                    "//button[contains(@type,'submit')]",
+                                    "//button[@role='button' and contains(., 'Next')]",
+                                    "//span[contains(text(), 'Next')]/ancestor::button",
+                                    "//button[contains(., 'Verify')]",
+                                ]
+                                
+                                submitted = False
+                                for btn_xpath in submit_btn_xpaths:
+                                    if element_exists(driver, btn_xpath, timeout=5):
+                                        click_xpath(driver, btn_xpath, timeout=10)
+                                        submitted = True
+                                        break
+                                
+                                if not submitted:
+                                    otp_input.send_keys(Keys.RETURN)
+                                
+                                # Wait and check result
+                                time.sleep(5)
+                                current_url = driver.current_url
+                                
+                                # Check if we left the TOTP page
+                                if "challenge/totp" not in current_url:
+                                    logger.info("[STEP] OTP verified successfully")
+                                    break
+                                
+                                # Still on TOTP page - generate new code for retry
+                                if retry < 2:
+                                    logger.warning(f"[STEP] Still on TOTP page, retrying with new code...")
+                                    time.sleep(3)  # Wait for new time window
+                                else:
+                                    logger.error("[STEP] OTP verification failed after 3 attempts")
+                                    return False, "OTP_REJECTED", "OTP code was rejected by Google"
+                            
+                            except Exception as otp_e:
+                                logger.error(f"[STEP] OTP submission error (attempt {retry + 1}): {otp_e}")
+                                if retry == 2:
+                                    return False, "OTP_SUBMISSION_ERROR", str(otp_e)
+                        
+                        # After TOTP success, continue waiting loop
+                        continue
+                    else:
+                        logger.warning("[STEP] On challenge/totp page but no OTP input found")
+                
+                # Other challenge types - log and continue waiting
+                logger.info(f"[STEP] Unhandled challenge type: {current_url}, waiting to see if it auto-resolves...")
+                continue
+            
+            # If we're here, not on any recognized page yet - keep waiting
+            if attempt < max_wait_attempts - 1:
+                logger.info(f"[STEP] Still waiting for login to complete... ({attempt + 1}/{max_wait_attempts})")
         
-        # If we get here, we waited but didn't detect login or challenge
-        logger.warning(f"[STEP] Login status unclear after waiting. Final URL: {current_url}")
-        return False, "LOGIN_TIMEOUT", f"Could not determine login status. URL: {current_url}"
+        # If we've exhausted all attempts and not logged in, fail
+        logger.error(f"[STEP] Login failed - did not reach myaccount.google.com after {max_wait_attempts} attempts")
+        logger.error(f"[STEP] Final URL: {current_url}")
+        return False, "LOGIN_TIMEOUT", f"Login timed out after {max_wait_attempts * wait_interval} seconds. Last URL: {current_url}"
 
-    except TimeoutException as e:
-        logger.error(f"[STEP] Timeout during login: {e}")
-        return False, "LOGIN_TIMEOUT", str(e)
     except Exception as e:
-        logger.error(f"[STEP] Unexpected error during login: {e}")
+        logger.error(f"[STEP] Login exception: {e}")
         logger.error(traceback.format_exc())
         return False, "LOGIN_EXCEPTION", str(e)
 
 
 # =====================================================================
-# Step 2: Navigate to security / authenticator / 2-step pages
+# Step 2: Setup Authenticator (extract TOTP secret)
 # =====================================================================
 
 
-def navigate_to_security(driver):
+def setup_authenticator(driver, email):
     """
-    From myaccount, navigate to Security / 2-Step Verification section.
+    Navigate to the authenticator setup page and extract the secret key.
+    Returns (success: bool, secret_key: str|None, error_code: str|None, error_message: str|None)
     """
+    logger.info(f"[STEP] Setting up Authenticator for {email}")
+    
     try:
-        logger.info("[STEP] Navigating to Security page")
-        driver.get("https://myaccount.google.com/security")
-        time.sleep(4)
+        # Navigate to authenticator setup page
+        logger.info("[STEP] Navigating to Authenticator setup page...")
+        driver.get("https://myaccount.google.com/two-step-verification/authenticator?hl=en")
+        time.sleep(3)
         
-        logger.info("[STEP] Navigating to 2-Step Verification page")
-        driver.get("https://myaccount.google.com/signinoptions/two-step-verification")
-        time.sleep(4)
-        
-        logger.info("[STEP] Navigation to security completed")
-        return True, None, None
-    except Exception as e:
-        logger.error(f"[STEP] Failed to navigate to security: {e}")
-        logger.error(traceback.format_exc())
-        return False, "NAVIGATION_FAILED", str(e)
-
-
-# =====================================================================
-# Step 3: Setup Authenticator App (extract secret)
-# =====================================================================
-
-
-def setup_authenticator_app(driver, email):
-    """
-    Enable/Setup Authenticator App and extract the TOTP secret key.
-    Then save it to SFTP server.
-    """
-    try:
-        logger.info("[STEP] Setting up Authenticator App")
-        
-        # Click "GET STARTED" or "Set up" button
-        setup_button_xpaths = [
-            "//button[contains(., 'GET STARTED')]",
-            "//button[contains(., 'Set up')]",
-            "//button[contains(., 'Add')]",
-            "//span[contains(text(), 'GET STARTED')]/ancestor::button",
-            "//span[contains(text(), 'Set up')]/ancestor::button",
+        # Check for and click "Get Started" button if present
+        get_started_xpaths = [
+            "//button[contains(., 'Get started')]",
+            "//button[contains(., 'SET UP')]",
+            "//span[contains(text(), 'Get started')]/ancestor::button",
+            "//span[contains(text(), 'SET UP')]/ancestor::button",
         ]
         
-        setup_clicked = False
-        for xpath in setup_button_xpaths:
+        for xpath in get_started_xpaths:
             if element_exists(driver, xpath, timeout=5):
-                click_xpath(driver, xpath, timeout=5)
-                setup_clicked = True
-                logger.info("[STEP] Clicked setup button for Authenticator App")
-                time.sleep(3)
+                click_xpath(driver, xpath, timeout=10)
+                logger.info(f"[STEP] Clicked Get Started button: {xpath}")
+                time.sleep(2)
                 break
         
-        if not setup_clicked:
-            logger.warning("[STEP] Could not find setup button, trying to navigate directly")
-            driver.get("https://myaccount.google.com/signinoptions/two-step-verification/enroll-welcome")
-            time.sleep(4)
-        
-        # Look for "Authenticator app" option
-        authenticator_xpaths = [
-            "//div[contains(., 'Authenticator app')]",
-            "//span[contains(text(), 'Authenticator app')]",
-            "//button[contains(., 'Authenticator app')]",
+        # Look for device selection (Android/iPhone) - select Android as it's more common
+        android_xpaths = [
+            "//button[contains(., 'Android')]",
+            "//div[contains(text(), 'Android')]/ancestor::button",
+            "//span[contains(text(), 'Android')]/ancestor::button",
         ]
         
-        for xpath in authenticator_xpaths:
+        for xpath in android_xpaths:
             if element_exists(driver, xpath, timeout=5):
-                try:
-                    click_xpath(driver, xpath, timeout=5)
-                    logger.info("[STEP] Selected Authenticator app option")
-                    time.sleep(3)
-                    break
-                except:
-                    continue
+                click_xpath(driver, xpath, timeout=10)
+                logger.info(f"[STEP] Selected Android device: {xpath}")
+                time.sleep(2)
+                break
         
-        # Look for secret key display
-        secret_key = None
+        # Click Next after device selection
+        next_button_xpaths = [
+            "//button[contains(., 'Next')]",
+            "//span[contains(text(), 'Next')]/ancestor::button",
+        ]
         
-        # Method 1: Look for "Can't scan it?" or "Enter this text code" link
+        for xpath in next_button_xpaths:
+            if element_exists(driver, xpath, timeout=5):
+                click_xpath(driver, xpath, timeout=10)
+                logger.info(f"[STEP] Clicked Next after device selection: {xpath}")
+                time.sleep(2)
+                break
+        
+        # Look for "Can't scan it?" link to get the secret key in text form
         cant_scan_xpaths = [
-            "//a[contains(., \"Can't scan\")]",
-            "//button[contains(., \"Can't scan\")]",
-            "//span[contains(text(), \"Can't scan\")]/ancestor::*[@role='button' or @role='link']",
+            "//button[contains(., \"Can't scan it\")]",
+            "//a[contains(., \"Can't scan it\")]",
+            "//span[contains(text(), \"Can't scan it\")]/ancestor::button",
+            "//div[contains(text(), \"Can't scan it\")]/ancestor::button",
         ]
         
         for xpath in cant_scan_xpaths:
             if element_exists(driver, xpath, timeout=5):
-                click_xpath(driver, xpath, timeout=5)
-                logger.info("[STEP] Clicked 'Can't scan' to reveal text code")
+                click_xpath(driver, xpath, timeout=10)
+                logger.info(f"[STEP] Clicked Can't scan it link: {xpath}")
                 time.sleep(2)
                 break
         
-        # Method 2: Extract secret from displayed text
-        secret_xpaths = [
-            "//code",
+        # Extract the secret key from the page
+        secret_key_xpaths = [
+            "//div[contains(@class, 'key')]//div[contains(@class, 'value')]",
             "//span[contains(@class, 'secret')]",
-            "//*[contains(text(), ' ') and string-length(text()) >= 16]",
+            "//div[contains(text(), ' ') and string-length(normalize-space(text())) >= 16]",
+            "//code",
+            "//pre",
         ]
         
-        for xpath in secret_xpaths:
+        secret_key = None
+        for xpath in secret_key_xpaths:
             try:
-                elements = driver.find_elements(By.XPATH, xpath)
-                for elem in elements:
-                    text = elem.text.strip().replace(" ", "").upper()
-                    # TOTP secrets are typically 16-32 chars, base32
-                    if len(text) >= 16 and text.isalnum():
-                        secret_key = text
-                        logger.info(f"[STEP] Secret key extracted: {secret_key[:4]}****")
+                element = wait_for_xpath(driver, xpath, timeout=10)
+                if element:
+                    text = element.text.strip()
+                    # Clean up the secret (remove spaces)
+                    cleaned = text.replace(" ", "").upper()
+                    if len(cleaned) >= 16:  # TOTP secrets are usually 16+ characters
+                        secret_key = cleaned
+                        logger.info(f"[STEP] Extracted secret key: {secret_key[:4]}****{secret_key[-4:]}")
                         break
-                if secret_key:
-                    break
             except:
                 continue
         
         if not secret_key:
-            logger.error("[STEP] Could not extract secret key")
-            return False, None, "SECRET_KEY_NOT_FOUND", "Could not find or extract TOTP secret"
+            logger.error("[STEP] Could not extract secret key from authenticator setup page")
+            return False, None, "SECRET_EXTRACTION_FAILED", "Failed to extract TOTP secret key"
         
-        # Save secret to SFTP
-        logger.info(f"[STEP] Saving secret key to SFTP server")
-        sftp_host, sftp_path = upload_secret_to_sftp(email, secret_key)
-        if not sftp_host:
-            logger.warning("[STEP] SFTP upload failed or not configured")
-        else:
-            logger.info(f"[STEP] Secret saved to SFTP: {sftp_host}:{sftp_path}")
-        
-        # Enter secret into authenticator to verify
-        try:
-            totp = pyotp.TOTP(secret_key)
-            code = totp.now()
-            logger.info(f"[STEP] Generated verification code: {code}")
-            
-            # Look for verification code input
-            code_input_xpaths = [
-                "//input[@type='tel']",
-                "//input[@autocomplete='one-time-code']",
-                "//input[contains(@aria-label, 'code') or contains(@aria-label, 'Code')]",
-            ]
-            
-            code_input = find_element_with_fallback(driver, code_input_xpaths, timeout=10, description="verification code input")
-            if code_input:
-                code_input.clear()
-                code_input.send_keys(code)
-                logger.info("[STEP] Entered verification code")
-                time.sleep(1)
-                
-                # Submit
-                submit_xpaths = [
-                    "//button[contains(., 'Next')]",
-                    "//button[contains(., 'Verify')]",
-                    "//button[@type='submit']",
-                    "//span[contains(text(), 'Next')]/ancestor::button",
-                ]
-                
-                for xpath in submit_xpaths:
-                    if element_exists(driver, xpath, timeout=5):
-                        click_xpath(driver, xpath, timeout=5)
-                        logger.info("[STEP] Submitted verification code")
-                        time.sleep(3)
-                        break
-        except Exception as e:
-            logger.warning(f"[STEP] Could not verify authenticator: {e}")
-        
-        logger.info("[STEP] Authenticator app setup completed")
         return True, secret_key, None, None
-        
+    
     except Exception as e:
-        logger.error(f"[STEP] Exception during authenticator setup: {e}")
+        logger.error(f"[STEP] Authenticator setup exception: {e}")
         logger.error(traceback.format_exc())
-        return False, None, "AUTHENTICATOR_EXCEPTION", str(e)
+        return False, None, "AUTHENTICATOR_SETUP_EXCEPTION", str(e)
 
 
 # =====================================================================
-# Step 4: Ensure 2-Step Verification is enabled
+# Step 3: Enable 2-Step Verification
 # =====================================================================
 
 
-def ensure_two_step_enabled(driver, email):
+def enable_two_step_verification(driver, email, secret_key):
     """
-    Ensure 2-Step Verification is fully enabled.
+    Complete the 2-Step Verification setup by entering a generated TOTP code.
+    Returns (success: bool, error_code: str|None, error_message: str|None)
     """
+    logger.info(f"[STEP] Enabling 2-Step Verification for {email}")
+    
     try:
-        logger.info("[STEP] Ensuring 2-Step Verification is enabled")
+        # Generate TOTP code from the secret we extracted
+        totp = pyotp.TOTP(secret_key)
+        otp_code = totp.now()
+        logger.info(f"[STEP] Generated TOTP code for verification: {otp_code}")
         
-        # Navigate to 2SV page
-        driver.get("https://myaccount.google.com/signinoptions/two-step-verification")
-        time.sleep(4)
-        
-        # Look for "Turn on" or "Enable" button
-        enable_xpaths = [
-            "//button[contains(., 'Turn on')]",
-            "//button[contains(., 'Enable')]",
-            "//span[contains(text(), 'Turn on')]/ancestor::button",
-            "//span[contains(text(), 'Enable')]/ancestor::button",
+        # Find the OTP input field
+        otp_input_xpaths = [
+            "//input[@type='tel']",
+            "//input[@autocomplete='one-time-code']",
+            "//input[@type='text' and contains(@aria-label, 'code')]",
         ]
         
-        for xpath in enable_xpaths:
+        otp_input = None
+        for xpath in otp_input_xpaths:
+            try:
+                otp_input = wait_for_xpath(driver, xpath, timeout=10)
+                if otp_input:
+                    logger.info(f"[STEP] Found OTP input field: {xpath}")
+                    break
+            except:
+                continue
+        
+        if not otp_input:
+            logger.error("[STEP] Could not find OTP input field for 2-Step Verification")
+            return False, "OTP_INPUT_NOT_FOUND", "OTP input field not found"
+        
+        # Enter the TOTP code
+        otp_input.clear()
+        otp_input.send_keys(otp_code)
+        logger.info("[STEP] Entered TOTP code")
+        time.sleep(1)
+        
+        # Click Next/Verify button
+        verify_button_xpaths = [
+            "//button[contains(., 'Next')]",
+            "//button[contains(., 'Verify')]",
+            "//span[contains(text(), 'Next')]/ancestor::button",
+            "//span[contains(text(), 'Verify')]/ancestor::button",
+        ]
+        
+        for xpath in verify_button_xpaths:
             if element_exists(driver, xpath, timeout=5):
-                click_xpath(driver, xpath, timeout=5)
-                logger.info("[STEP] Clicked enable 2SV button")
+                click_xpath(driver, xpath, timeout=10)
+                logger.info(f"[STEP] Clicked Verify button: {xpath}")
                 time.sleep(3)
                 break
         
-        # Handle any confirmation prompts
-        confirm_xpaths = [
-            "//button[contains(., 'Continue')]",
+        # Click "Turn On" or final confirmation button
+        turn_on_xpaths = [
+            "//button[contains(., 'Turn on')]",
+            "//button[contains(., 'TURN ON')]",
             "//button[contains(., 'Done')]",
-            "//button[contains(., 'Got it')]",
-            "//span[contains(text(), 'Continue')]/ancestor::button",
+            "//span[contains(text(), 'Turn on')]/ancestor::button",
             "//span[contains(text(), 'Done')]/ancestor::button",
         ]
         
-        for xpath in confirm_xpaths:
+        for xpath in turn_on_xpaths:
             if element_exists(driver, xpath, timeout=5):
-                try:
-                    click_xpath(driver, xpath, timeout=5)
-                    logger.info("[STEP] Clicked confirmation button")
-                    time.sleep(2)
-                except:
-                    continue
+                click_xpath(driver, xpath, timeout=10)
+                logger.info(f"[STEP] Clicked Turn On button: {xpath}")
+                time.sleep(2)
+                break
         
-        logger.info("[STEP] 2-Step Verification is enabled")
+        logger.info("[STEP] 2-Step Verification enabled successfully")
         return True, None, None
-        
+    
     except Exception as e:
-        logger.error(f"[STEP] Exception ensuring 2SV: {e}")
+        logger.error(f"[STEP] 2-Step Verification exception: {e}")
         logger.error(traceback.format_exc())
-        return False, "2SV_ENABLE_FAILED", str(e)
+        return False, "2STEP_ENABLE_EXCEPTION", str(e)
 
 
 # =====================================================================
-# Step 5: Generate App password
+# Step 4: Generate App Password
 # =====================================================================
 
 
 def generate_app_password(driver, email):
     """
-    Navigate to app passwords page and generate a new app password.
-    Includes page refresh logic if input field not found.
-    Uses random app name.
-    Return the password string.
+    Navigate to App Passwords page and generate a new app password.
+    Returns (success: bool, app_password: str|None, error_code: str|None, error_message: str|None)
     """
-    import random
-    import string
+    logger.info(f"[STEP] Generating App Password for {email}")
     
     try:
-        logger.info("[STEP] Opening App Passwords page")
-        driver.get("https://myaccount.google.com/apppasswords?hl=en")
-        time.sleep(5)
-
-        # Check if we need to select app type first
-        app_name_xpaths = [
-            "//input[@aria-label='App name']",
-            "//input[contains(@placeholder, 'app') or contains(@placeholder, 'name')]",
-            "//input[@type='text' and not(@type='password')]",
-            "//input[contains(@class, 'app-name')]",
-        ]
+        # Navigate to app passwords page
+        logger.info("[STEP] Navigating to App Passwords page...")
+        driver.get("https://myaccount.google.com/apppasswords")
+        time.sleep(3)
         
-        # Try to find app name field - with retry and refresh
-        max_attempts = 3
-        app_name_field = None
-        
-        for attempt in range(max_attempts):
-            app_name_field = find_element_with_fallback(driver, app_name_xpaths, timeout=10, description="app name field")
-            
-            if app_name_field:
-                break
-            else:
-                if attempt < max_attempts - 1:
-                    logger.warning(f"[STEP] App name field not found (attempt {attempt + 1}/{max_attempts}), refreshing page...")
-                    driver.refresh()
-                    time.sleep(5)
-                else:
-                    logger.error("[STEP] App name field not found after multiple attempts")
-                    return False, None, "APP_NAME_FIELD_NOT_FOUND", "Could not locate app name input field"
-        
-        # Generate random app name
+        # Generate random app name (e.g., "SMTP-XXXXXXXX")
         random_suffix = ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
         app_name = f"SMTP-{random_suffix}"
+        logger.info(f"[STEP] Generated app name: {app_name}")
         
-        app_name_field.clear()
-        time.sleep(0.5)
-        app_name_field.send_keys(app_name)
-        logger.info(f"[STEP] Entered random app name: {app_name}")
+        # If page doesn't load properly, try refreshing
+        for refresh_attempt in range(3):
+            # Look for the app name input field
+            app_name_input_xpaths = [
+                "//input[@type='text']",
+                "//input[@aria-label*='app' or @aria-label*='App']",
+                "//input[@placeholder*='app' or @placeholder*='App']",
+            ]
+            
+            app_name_input = None
+            for xpath in app_name_input_xpaths:
+                try:
+                    app_name_input = wait_for_xpath(driver, xpath, timeout=10)
+                    if app_name_input:
+                        logger.info(f"[STEP] Found app name input field: {xpath}")
+                        break
+                except:
+                    continue
+            
+            if app_name_input:
+                break  # Found the input field
+            else:
+                # Input not found - try refreshing the page
+                logger.warning(f"[STEP] App name input not found, refreshing page (attempt {refresh_attempt + 1}/3)")
+                driver.refresh()
+                time.sleep(3)
+        
+        if not app_name_input:
+            logger.error("[STEP] Could not find app name input field after 3 attempts")
+            return False, None, "APP_NAME_INPUT_NOT_FOUND", "App name input field not found"
+        
+        # Enter app name
+        app_name_input.clear()
+        app_name_input.send_keys(app_name)
+        logger.info(f"[STEP] Entered app name: {app_name}")
         time.sleep(1)
-
-        # Click Generate/Create button
+        
+        # Click Generate button
         generate_button_xpaths = [
             "//button[contains(., 'Generate')]",
-            "//button[contains(., 'Create')]",
-            "//button[contains(@aria-label, 'Generate')]",
-            "//button[contains(@aria-label, 'Create')]",
+            "//button[contains(., 'CREATE')]",
             "//span[contains(text(), 'Generate')]/ancestor::button",
-            "//span[contains(text(), 'Create')]/ancestor::button",
-            "//button[contains(., 'Next')]",
+            "//span[contains(text(), 'CREATE')]/ancestor::button",
         ]
         
-        generate_clicked = False
         for xpath in generate_button_xpaths:
             if element_exists(driver, xpath, timeout=5):
-                click_xpath(driver, xpath, timeout=5)
-                generate_clicked = True
-                logger.info("[STEP] Clicked generate/create button")
-                time.sleep(5)
+                click_xpath(driver, xpath, timeout=10)
+                logger.info(f"[STEP] Clicked Generate button: {xpath}")
+                time.sleep(3)
                 break
         
-        if not generate_clicked:
-            logger.warning("[STEP] Could not find generate button, checking if password already displayed")
-        
-        # Extract app password - try multiple patterns
-        password = None
-        password_xpaths = [
-            # Common patterns for app password display
-            "//code[contains(text(), '-')]",
-            "//span[contains(text(), '-') and string-length(text()) >= 16]",
-            "//div[contains(text(), '-') and string-length(text()) >= 16]",
-            "//strong[contains(text(), '-')]",
-            "//*[contains(@class, 'password')]//code",
-            "//*[contains(@class, 'password')]//span",
+        # Extract the generated app password
+        # It's usually displayed in a format like "abcd efgh ijkl mnop" (16 characters with spaces)
+        app_password_xpaths = [
+            "//div[contains(@class, 'password')]",
+            "//div[contains(@class, 'generated')]",
+            "//strong[contains(@class, 'v2CTKd')]",
+            "//div[contains(text(), '-')]",  # App passwords often contain dashes
+            "//code",
+            "//pre",
         ]
         
-        for xpath in password_xpaths:
+        app_password = None
+        for xpath in app_password_xpaths:
             try:
                 element = wait_for_xpath(driver, xpath, timeout=10)
-                text = element.text.strip()
-                # App passwords are 16 chars with dashes: xxxx-xxxx-xxxx-xxxx
-                text = text.replace(" ", "")
-                if "-" in text and len(text.replace("-", "")) == 16:
-                    password = text
-                    logger.info(f"[STEP] App password extracted: {password[:8]}****")
-                    break
-            except TimeoutException:
-                continue
-
-        # If not found with dashes, try to find 16-char string and format it
-        if not password:
-            try:
-                # Look for any element with 16+ characters
-                all_elements = driver.find_elements(By.XPATH, "//*[string-length(text()) >= 16]")
-                for el in all_elements:
-                    text = el.text.strip().replace(" ", "").replace("-", "")
-                    if len(text) == 16 and text.isalnum():
-                        # Format as xxxx-xxxx-xxxx-xxxx
-                        password = f"{text[:4]}-{text[4:8]}-{text[8:12]}-{text[12:16]}"
-                        logger.info(f"[STEP] App password extracted and formatted: {password[:8]}****")
+                if element:
+                    text = element.text.strip()
+                    # Clean up (remove spaces, keep dashes)
+                    cleaned = text.replace(" ", "")
+                    # App passwords are usually 16-19 characters (16 chars + 3 dashes)
+                    if len(cleaned) >= 16:
+                        app_password = cleaned
+                        logger.info(f"[STEP] Extracted app password: {app_password[:4]}****{app_password[-4:]}")
                         break
-            except Exception as e:
-                logger.warning(f"[STEP] Could not extract password from text elements: {e}")
+            except:
+                continue
         
-        if not password:
+        # If not found with standard methods, try looking at all text on page
+        if not app_password:
+            logger.warning("[STEP] Could not find app password with standard xpaths, trying page source...")
+            try:
+                page_source = driver.page_source
+                # Look for pattern like "abcd-efgh-ijkl-mnop"
+                pattern = r'[a-z]{4}-[a-z]{4}-[a-z]{4}-[a-z]{4}'
+                matches = re.findall(pattern, page_source)
+                if matches:
+                    app_password = matches[0]
+                    logger.info(f"[STEP] Found app password in page source: {app_password[:4]}****{app_password[-4:]}")
+            except:
+                pass
+        
+        if not app_password:
             logger.error("[STEP] Could not extract app password from page")
-            return False, None, "APP_PASSWORD_NOT_FOUND", "No app password text detected"
-
-        logger.info(f"[STEP] App password obtained for {email}")
-        return True, password, None, None
-
+            return False, None, "APP_PASSWORD_EXTRACTION_FAILED", "Failed to extract app password"
+        
+        # Click Done to close the dialog
+        done_button_xpaths = [
+            "//button[contains(., 'Done')]",
+            "//button[contains(., 'Close')]",
+            "//span[contains(text(), 'Done')]/ancestor::button",
+        ]
+        
+        for xpath in done_button_xpaths:
+            if element_exists(driver, xpath, timeout=5):
+                click_xpath(driver, xpath, timeout=10)
+                logger.info(f"[STEP] Clicked Done button: {xpath}")
+                break
+        
+        logger.info("[STEP] App Password generated successfully")
+        return True, app_password, None, None
+    
     except Exception as e:
-        logger.error(f"[STEP] Exception generating app password: {e}")
+        logger.error(f"[STEP] App Password generation exception: {e}")
         logger.error(traceback.format_exc())
         return False, None, "APP_PASSWORD_EXCEPTION", str(e)
 
 
 # =====================================================================
-# Orchestration: one account per Lambda
-# =====================================================================
-
-
-def process_one_account(driver, email, password, known_totp_secret=None):
-    """
-    Complete workflow for one Google Workspace account:
-    1. Login
-    2. Handle post-login pages
-    3. Navigate to security
-    4. Setup authenticator (extract secret, save to SFTP)
-    5. Enable 2-step verification
-    6. Generate app password
-    7. Save app password to S3
-    
-    Returns:
-      (success, step_completed, error_code, error_message, secret_key, app_password, s3_bucket, s3_key, timings)
-    """
-    start_time = time.time()
-    timings = {}
-    
-    step = "login"
-    s3_bucket = None
-    s3_key = None
-    secret_key = None
-    app_password = None
-
-    # 1. LOGIN
-    step_start = time.time()
-    ok, err_type, err_msg = login_google(driver, email, password, known_totp_secret)
-    timings["login"] = time.time() - step_start
-    if not ok:
-        return False, step, err_type, err_msg, secret_key, app_password, s3_bucket, s3_key, timings
-
-    # 1b. HANDLE POST-LOGIN PAGES (Speedbump, verification, etc.)
-    step = "post_login_navigation"
-    step_start = time.time()
-    ok, err_type, err_msg = handle_post_login_pages(driver, max_attempts=20)
-    timings["post_login_navigation"] = time.time() - step_start
-    if not ok:
-        return False, step, err_type, err_msg, secret_key, app_password, s3_bucket, s3_key, timings
-    
-    logger.info("[STEP] Successfully reached myaccount.google.com, proceeding to security setup")
-
-    # 2. NAVIGATE SECURITY
-    step = "navigation"
-    step_start = time.time()
-    ok, err_type, err_msg = navigate_to_security(driver)
-    timings["navigation"] = time.time() - step_start
-    if not ok:
-        return False, step, err_type, err_msg, secret_key, app_password, s3_bucket, s3_key, timings
-
-    # 3. AUTHENTICATOR APP
-    step = "authenticator_setup"
-    step_start = time.time()
-    ok, secret_key, err_type, err_msg = setup_authenticator_app(driver, email)
-    timings["authenticator_setup"] = time.time() - step_start
-    if not ok:
-        return False, step, err_type, err_msg, secret_key, app_password, s3_bucket, s3_key, timings
-
-    # 4. 2-STEP
-    step = "2step_verification"
-    step_start = time.time()
-    ok, err_type, err_msg = ensure_two_step_enabled(driver, email)
-    timings["2step_verification"] = time.time() - step_start
-    if not ok:
-        return False, step, err_type, err_msg, secret_key, app_password, s3_bucket, s3_key, timings
-
-    # 5. APP PASSWORD
-    step = "app_password"
-    step_start = time.time()
-    ok, app_password, err_type, err_msg = generate_app_password(driver, email)
-    timings["app_password"] = time.time() - step_start
-    if not ok:
-        return False, step, err_type, err_msg, secret_key, app_password, s3_bucket, s3_key, timings
-
-    # Save to S3 global file
-    step_start = time.time()
-    success_s3, s3_bucket, s3_key = append_app_password_to_s3(email, app_password)
-    timings["s3_save"] = time.time() - step_start
-    if not success_s3:
-        return False, step, "S3_SAVE_FAILED", "App password generated but S3 save failed", secret_key, app_password, s3_bucket, s3_key, timings
-
-    timings["total"] = time.time() - start_time
-    return True, "completed", None, None, secret_key, app_password, s3_bucket, s3_key, timings
-
-
-# =====================================================================
-# Lambda handler: ONE ACCOUNT PER INVOCATION
+# Lambda Handler
 # =====================================================================
 
 
 def handler(event, context):
     """
-    Lambda entrypoint.
-
-    Expected event:
-      {
+    AWS Lambda handler function.
+    
+    Expected event format:
+    {
         "email": "user@example.com",
-        "password": "clear-text-password",
-        "known_totp_secret": "BASE32SECRET"  // optional
-      }
-
-    You can also provide these via environment variables:
-      GW_EMAIL, GW_PASSWORD, KNOWN_TOTP_SECRET
-
-    Returns JSON with:
-      status          = "ok" | "failed"
-      email
-      step_completed  = "login" | "navigation" | "authenticator_setup" | "2step_verification" | "app_password" | "completed"
-      error_step      = step where error occurred (if failed)
-      error_message   = error description (if failed)
-      app_password    = generated app password (if successful)
-      secret_key      = extracted TOTP secret (if successful, masked)
-      app_passwords_s3_bucket
-      app_passwords_s3_key
-      timings         = dict of timing information
+        "password": "userpassword"
+    }
+    
+    Returns JSON with status, step_completed, error info, app_password, secret_key, and timings.
     """
+    start_time = time.time()
+    timings = {}
+    
     logger.info("=" * 60)
     logger.info("[LAMBDA] Handler invoked")
     logger.info(f"[LAMBDA] Event type: {type(event)}")
     logger.info(f"[LAMBDA] Event content: {event}")
     logger.info(f"[LAMBDA] Context: {context}")
     logger.info("=" * 60)
-
-    # Parse input
-    email = event.get("email") or os.environ.get("GW_EMAIL")
-    password = event.get("password") or os.environ.get("GW_PASSWORD")
-    known_totp_secret = event.get("known_totp_secret") or os.environ.get("KNOWN_TOTP_SECRET")
-
+    
+    # Extract email and password from event
+    email = event.get("email", os.environ.get("GW_EMAIL"))
+    password = event.get("password", os.environ.get("GW_PASSWORD"))
+    
     if not email or not password:
         return {
             "status": "failed",
+            "step_completed": "init",
             "error_step": "init",
-            "error_message": "Missing email or password in event/environment",
-            "step_completed": "init"
-        }
-
-    driver = None
-    try:
-        # Initialize Chrome driver
-        driver = get_chrome_driver()
-        logger.info(f"[LAMBDA] Chrome driver started for {email}")
-
-        # Process account
-        success, step, err_type, err_msg, secret_key, app_password, s3_bucket, s3_key, timings = process_one_account(
-            driver, email, password, known_totp_secret
-        )
-
-        # Clean response
-        response = {
-            "status": "ok" if success else "failed",
-            "email": email,
-            "step_completed": step,
+            "error_message": "Email or password not provided in event or environment",
+            "app_password": None,
+            "secret_key": None,
             "timings": timings
         }
-
+    
+    driver = None
+    secret_key = None
+    app_password = None
+    step_completed = "init"
+    error_code = None
+    error_message = None
+    
+    try:
+        # Step 0: Initialize Chrome driver
+        step_start = time.time()
+        driver = get_chrome_driver()
+        timings["driver_init"] = round(time.time() - step_start, 2)
+        logger.info(f"[LAMBDA] Chrome driver started for {email}")
+        
+        # Step 1: Login
+        step_completed = "login"
+        step_start = time.time()
+        success, error_code, error_message = login_google(driver, email, password)
+        timings["login"] = round(time.time() - step_start, 2)
+        
         if not success:
-            response["error_step"] = step
-            response["error_message"] = err_msg or "Unknown error"
-        else:
-            response["app_password"] = app_password
-            response["secret_key"] = f"{secret_key[:4]}****" if secret_key else None
-            response["app_passwords_s3_bucket"] = s3_bucket
-            response["app_passwords_s3_key"] = s3_key
-
-        return response
-
+            logger.error(f"[STEP] Login failed: {error_message}")
+            return {
+                "status": "failed",
+                "step_completed": step_completed,
+                "error_step": step_completed,
+                "error_message": error_message,
+                "app_password": None,
+                "secret_key": None,
+                "timings": timings
+            }
+        
+        # Step 2: Setup Authenticator (extract secret)
+        step_completed = "authenticator_setup"
+        step_start = time.time()
+        success, secret_key, error_code, error_message = setup_authenticator(driver, email)
+        timings["authenticator_setup"] = round(time.time() - step_start, 2)
+        
+        if not success:
+            logger.error(f"[STEP] Authenticator setup failed: {error_message}")
+            return {
+                "status": "failed",
+                "step_completed": step_completed,
+                "error_step": step_completed,
+                "error_message": error_message,
+                "app_password": None,
+                "secret_key": None,
+                "timings": timings
+            }
+        
+        # Step 2.5: Upload secret to SFTP
+        step_start = time.time()
+        sftp_host, sftp_path = upload_secret_to_sftp(email, secret_key)
+        timings["sftp_upload"] = round(time.time() - step_start, 2)
+        
+        if not sftp_host:
+            logger.warning("[SFTP] Could not upload secret to SFTP, continuing anyway...")
+        
+        # Step 3: Enable 2-Step Verification
+        step_completed = "2step_verification"
+        step_start = time.time()
+        success, error_code, error_message = enable_two_step_verification(driver, email, secret_key)
+        timings["2step_verification"] = round(time.time() - step_start, 2)
+        
+        if not success:
+            logger.error(f"[STEP] 2-Step Verification failed: {error_message}")
+            return {
+                "status": "failed",
+                "step_completed": step_completed,
+                "error_step": step_completed,
+                "error_message": error_message,
+                "app_password": None,
+                "secret_key": secret_key[:4] + "****" + secret_key[-4:] if secret_key else None,
+                "timings": timings
+            }
+        
+        # Step 4: Generate App Password
+        step_completed = "app_password"
+        step_start = time.time()
+        success, app_password, error_code, error_message = generate_app_password(driver, email)
+        timings["app_password"] = round(time.time() - step_start, 2)
+        
+        if not success:
+            logger.error(f"[STEP] App Password generation failed: {error_message}")
+            return {
+                "status": "failed",
+                "step_completed": step_completed,
+                "error_step": step_completed,
+                "error_message": error_message,
+                "app_password": None,
+                "secret_key": secret_key[:4] + "****" + secret_key[-4:] if secret_key else None,
+                "timings": timings
+            }
+        
+        # Step 4.5: Append App Password to S3
+        step_start = time.time()
+        s3_success, s3_bucket, s3_key = append_app_password_to_s3(email, app_password)
+        timings["s3_upload"] = round(time.time() - step_start, 2)
+        
+        if not s3_success:
+            logger.warning("[S3] Could not upload app password to S3, continuing anyway...")
+        
+        # All steps completed successfully
+        step_completed = "completed"
+        total_time = round(time.time() - start_time, 2)
+        timings["total"] = total_time
+        
+        logger.info(f"[LAMBDA] All steps completed successfully for {email} in {total_time} seconds")
+        
+        return {
+            "status": "success",
+            "step_completed": step_completed,
+            "error_step": None,
+            "error_message": None,
+            "app_password": app_password,
+            "secret_key": secret_key[:4] + "****" + secret_key[-4:] if secret_key else None,  # Masked for security
+            "timings": timings
+        }
+    
     except Exception as e:
         logger.error(f"[LAMBDA] Unhandled exception: {e}")
         logger.error(traceback.format_exc())
+        
+        total_time = round(time.time() - start_time, 2)
+        timings["total"] = total_time
+        
         return {
             "status": "failed",
-            "error_step": "init",
-            "error_message": str(e),
-            "step_completed": "init"
+            "step_completed": step_completed,
+            "error_step": step_completed,
+            "error_message": f"Unhandled exception: {str(e)}",
+            "app_password": app_password,
+            "secret_key": secret_key[:4] + "****" + secret_key[-4:] if secret_key else None,
+            "timings": timings
         }
+    
     finally:
+        # Always cleanup driver
         if driver:
             try:
                 driver.quit()
