@@ -389,17 +389,30 @@ def append_app_password_to_s3(email, app_password):
         # Try to fetch existing file content
         existing_content = ""
         existing_entries = {}  # Dictionary to track email:password pairs (for duplicate removal)
+        file_exists = False
+        
         try:
             obj = s3.get_object(Bucket=bucket, Key=key)
             existing_content = obj['Body'].read().decode('utf-8')
+            file_exists = True
             # Parse existing entries (format: email:password)
             for line in existing_content.strip().split('\n'):
-                if ':' in line:
+                if ':' in line and line.strip():
                     existing_email, existing_password = line.strip().split(':', 1)
                     existing_entries[existing_email.strip()] = existing_password.strip()
             logger.info(f"[S3] Loaded {len(existing_entries)} existing entries from {key}")
         except s3.exceptions.NoSuchKey:
             logger.info(f"[S3] {key} does not exist yet, will create it.")
+            file_exists = False
+        except s3.exceptions.ClientError as read_err:
+            error_code = read_err.response.get('Error', {}).get('Code', '')
+            if error_code == 'AccessDenied':
+                logger.error(f"[S3] Access Denied when reading {key} - Lambda IAM role may not have S3 permissions.")
+                logger.error(f"[S3] Please click 'Create / Update Production Lambda' in aws.py to ensure IAM role has 'AmazonS3FullAccess' policy.")
+                # Try to write anyway - sometimes write permissions work even if read doesn't
+                logger.warning(f"[S3] Attempting to create/write {key} anyway (may fail if no write permissions)...")
+            else:
+                logger.warning(f"[S3] Could not read existing file ({error_code}): {read_err}")
         except Exception as e:
             logger.warning(f"[S3] Could not read existing file: {e}")
 
@@ -411,23 +424,28 @@ def append_app_password_to_s3(email, app_password):
         for entry_email, entry_password in sorted(existing_entries.items()):
             updated_content += f"{entry_email}:{entry_password}\n"
 
-        # Write back
-        s3.put_object(
-            Bucket=bucket, 
-            Key=key, 
-            Body=updated_content.encode('utf-8'),
-            ContentType='text/plain'
-        )
-        logger.info(f"[S3] App password saved to s3://{bucket}/{key} (total entries: {len(existing_entries)})")
-        return True, bucket, key
+        # Write back (create file if it doesn't exist)
+        try:
+            s3.put_object(
+                Bucket=bucket, 
+                Key=key, 
+                Body=updated_content.encode('utf-8'),
+                ContentType='text/plain'
+            )
+            action = "created" if not file_exists else "updated"
+            logger.info(f"[S3] App password saved to s3://{bucket}/{key} ({action}, total entries: {len(existing_entries)})")
+            return True, bucket, key
+        except s3.exceptions.ClientError as write_err:
+            error_code = write_err.response.get('Error', {}).get('Code', '')
+            if error_code == 'AccessDenied':
+                logger.error(f"[S3] Access Denied when writing to {key}")
+                logger.error(f"[S3] CRITICAL: Lambda IAM role does not have S3 write permissions!")
+                logger.error(f"[S3] ACTION REQUIRED: Click 'Create / Update Production Lambda' in aws.py to attach 'AmazonS3FullAccess' policy to the IAM role.")
+                logger.error(f"[S3] The Lambda role name is: edu-gw-app-password-lambda-role")
+            else:
+                logger.error(f"[S3] S3 ClientError when writing ({error_code}): {write_err}")
+            return False, bucket, key
 
-    except s3.exceptions.ClientError as e:
-        error_code = e.response.get('Error', {}).get('Code', '')
-        if error_code == 'AccessDenied':
-            logger.error(f"[S3] Access Denied - Lambda IAM role may not have S3 permissions. Please ensure the role has 'AmazonS3FullAccess' policy attached.")
-        else:
-            logger.error(f"[S3] S3 ClientError: {error_code} - {e}")
-        return False, bucket, key
     except Exception as e:
         logger.error(f"[S3] Failed to write {key} to S3: {e}")
         logger.error(traceback.format_exc())
