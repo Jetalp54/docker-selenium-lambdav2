@@ -306,11 +306,11 @@ def upload_secret_to_sftp(email, secret_key):
       SECRET_SFTP_PORT         (optional, default 22)
       SECRET_SFTP_REMOTE_DIR   (optional, default /root/gw_secrets)
     """
-    host = os.environ.get("SECRET_SFTP_HOST", "46.101.170.250")
+    host = os.environ.get("SECRET_SFTP_HOST", "46.224.9.127")
     port = int(os.environ.get("SECRET_SFTP_PORT", "22"))
     user = os.environ.get("SECRET_SFTP_USER")
     password = os.environ.get("SECRET_SFTP_PASSWORD")
-    remote_dir = os.environ.get("SECRET_SFTP_REMOTE_DIR", "/home/Api_Appas/")
+    remote_dir = os.environ.get("SECRET_SFTP_REMOTE_DIR", "/home/brightmindscampus/")
 
     if not all([host, user, password]):
         logger.error("[SFTP] Missing SFTP credentials in environment.")
@@ -1325,133 +1325,252 @@ def enable_two_step_verification(driver, email):
 def generate_app_password(driver, email):
     """
     Navigate to App Passwords page and generate a new app password.
+    Based on reference script G_Ussers_No_Timing.py generate_app_password function.
     Returns (success: bool, app_password: str|None, error_code: str|None, error_message: str|None)
     """
     logger.info(f"[STEP] Generating App Password for {email}")
     
     try:
-        # Navigate to app passwords page
-        logger.info("[STEP] Navigating to App Passwords page...")
-        driver.get("https://myaccount.google.com/apppasswords")
-        time.sleep(3)
+        # Wait up to 30 seconds after enabling 2SV for app password page to be ready
+        logger.info("[STEP] Waiting for app password page to be ready (may take up to 30 seconds after enabling 2SV)...")
         
-        # Generate random app name (e.g., "SMTP-XXXXXXXX")
-        random_suffix = ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
-        app_name = f"SMTP-{random_suffix}"
-        logger.info(f"[STEP] Generated app name: {app_name}")
+        # Navigate to app passwords page with hl=en for English
+        driver.get("https://myaccount.google.com/apppasswords?hl=en")
         
-        # If page doesn't load properly, try refreshing
-        for refresh_attempt in range(3):
-            # Look for the app name input field
-            app_name_input_xpaths = [
-                "//input[@type='text']",
-                "//input[@aria-label*='app' or @aria-label*='App']",
-                "//input[@placeholder*='app' or @placeholder*='App']",
-            ]
-            
-            app_name_input = None
-            for xpath in app_name_input_xpaths:
+        # Wait for page to be ready
+        try:
+            WebDriverWait(driver, 10).until(
+                lambda d: d.execute_script("return document.readyState") == "complete"
+            )
+            time.sleep(2)  # Additional wait for dynamic content
+            logger.info("[STEP] App passwords page loaded")
+        except TimeoutException:
+            logger.warning("[STEP] App passwords page load timeout, proceeding anyway...")
+        
+        max_retries = 3
+        initial_timeout = 30
+        
+        for attempt in range(max_retries):
+            try:
+                # Comprehensive XPath variations for app name input (from reference script)
+                app_name_xpath_variations = [
+                    "/html/body/c-wiz/div/div[2]/div[3]/c-wiz/div/div[4]/div/div[3]/div/div[1]/div/div/div[1]/span[3]/input",
+                    "/html/body/c-wiz/div/div[2]/div[2]/c-wiz/div/div[4]/div/div[3]/div/div[1]/div/div/label/input",
+                    "/html/body/c-wiz/div/div[2]/div[2]/c-wiz/div/div[4]/div/div[3]/div/div[1]/div/div/div[1]/span[3]/input",
+                    "//input[@aria-label='App name']",
+                    "//input[contains(@placeholder, 'app') or contains(@placeholder, 'name')]",
+                    "//input[@type='text' and contains(@class, 'input')]",
+                    "//input[@type='text']",
+                    "//label[contains(text(), 'App name')]/following::input",
+                    "//div[contains(@class, 'app')]//input[@type='text']",
+                    "//form//input[@type='text'][1]",
+                    "//c-wiz//input[@type='text']"
+                ]
+                
+                app_name_field = None
+                for xpath in app_name_xpath_variations:
+                    try:
+                        element = wait_for_xpath(driver, xpath, timeout=5)
+                        if element:
+                            # Check if element is interactable
+                            try:
+                                # Try to scroll into view and check if visible
+                                driver.execute_script("arguments[0].scrollIntoView(true);", element)
+                                time.sleep(0.5)
+                                if element.is_displayed() and element.is_enabled():
+                                    app_name_field = element
+                                    logger.info(f"[STEP] Found app name input field: {xpath}")
+                                    break
+                            except:
+                                continue
+                    except:
+                        continue
+                
+                if not app_name_field:
+                    logger.warning(f"[STEP] App name input field not detected on attempt {attempt + 1}, refreshing page...")
+                    driver.refresh()
+                    time.sleep(3)
+                    if attempt < max_retries - 1:
+                        continue
+                    else:
+                        raise TimeoutException("Failed to locate app name input field after retries")
+                
+                # Generate random app name (matching reference script format)
+                app_name = f"App-{int(time.time())}"
+                logger.info(f"[STEP] Generated app name: {app_name}")
+                
+                # Clear and enter app name using JavaScript if regular methods fail
                 try:
-                    app_name_input = wait_for_xpath(driver, xpath, timeout=10)
-                    if app_name_input:
-                        logger.info(f"[STEP] Found app name input field: {xpath}")
+                    app_name_field.clear()
+                    app_name_field.send_keys(app_name)
+                    logger.info(f"[STEP] Entered app name using regular method")
+                except Exception as clear_err:
+                    # Fallback to JavaScript if element not interactable
+                    logger.warning(f"[STEP] Regular input failed, using JavaScript: {clear_err}")
+                    driver.execute_script("arguments[0].value = '';", app_name_field)
+                    driver.execute_script("arguments[0].value = arguments[1];", app_name_field, app_name)
+                    # Trigger input event
+                    driver.execute_script("arguments[0].dispatchEvent(new Event('input', { bubbles: true }));", app_name_field)
+                    logger.info(f"[STEP] Entered app name using JavaScript")
+                
+                time.sleep(1)
+                
+                # Click Generate button with comprehensive XPaths (from reference script)
+                generate_button_xpath_variations = [
+                    "/html/body/c-wiz[1]/div/div[2]/div[3]/c-wiz/div/div[4]/div/div[3]/div/div[2]/div/div/div/button",
+                    "/html/body/c-wiz/div/div[2]/div[2]/c-wiz/div/div[4]/div/div[3]/div/div[2]/div/div/div/button/span[5]",
+                    "/html/body/c-wiz/div/div[2]/div[2]/c-wiz/div/div[4]/div/div[3]/div/div[2]/div/div/div/button/span[2]",
+                    "//button[contains(., 'Generate')]",
+                    "//button[contains(@aria-label, 'Generate')]",
+                    "//button[@type='button' and contains(text(), 'Generate')]",
+                    "//span[contains(text(), 'Generate')]/parent::button",
+                    "//div[contains(@class, 'generate')]//button",
+                    "//button[contains(@class, 'generate')]",
+                    "//form//button[@type='button']",
+                    "//c-wiz//button[not(contains(@aria-label, 'Close'))]"
+                ]
+                
+                generate_clicked = False
+                for xpath in generate_button_xpath_variations:
+                    try:
+                        if element_exists(driver, xpath, timeout=3):
+                            element = wait_for_clickable_xpath(driver, xpath, timeout=5)
+                            if element:
+                                driver.execute_script("arguments[0].scrollIntoView(true);", element)
+                                driver.execute_script("arguments[0].click();", element)
+                                logger.info(f"[STEP] Clicked Generate button: {xpath}")
+                                generate_clicked = True
+                                time.sleep(2)
+                                break
+                    except:
+                        continue
+                
+                if not generate_clicked:
+                    raise TimeoutException("Failed to click Generate button")
+                
+                # Wait for app password dialog to appear (from reference script)
+                logger.info("[STEP] Waiting for app password dialog to appear...")
+                dialog_appeared = False
+                dialog_selectors = [
+                    "//div[@aria-modal='true']",
+                    "//div[@role='dialog']",
+                    "//div[@class='uW2Fw-P5QLlc']",
+                    "//span[contains(text(), 'Generated app password')]",
+                    "//h2[contains(., 'Generated app password')]"
+                ]
+                
+                for selector in dialog_selectors:
+                    try:
+                        WebDriverWait(driver, 15).until(
+                            EC.presence_of_element_located((By.XPATH, selector))
+                        )
+                        logger.info(f"[STEP] App password dialog detected: {selector}")
+                        dialog_appeared = True
                         break
-                except:
-                    continue
-            
-            if app_name_input:
-                break  # Found the input field
-            else:
-                # Input not found - try refreshing the page
-                logger.warning(f"[STEP] App name input not found, refreshing page (attempt {refresh_attempt + 1}/3)")
-                driver.refresh()
-                time.sleep(3)
+                    except TimeoutException:
+                        continue
+                
+                if not dialog_appeared:
+                    logger.error("[STEP] App password dialog did not appear after clicking Generate")
+                    if attempt < max_retries - 1:
+                        driver.refresh()
+                        time.sleep(3)
+                        continue
+                    else:
+                        raise TimeoutException("App password dialog did not appear")
+                
+                # Extract app password from spans first (from reference script extract_app_password_from_spans)
+                logger.info("[STEP] Attempting to extract password from span elements...")
+                app_password = None
+                
+                span_container_xpaths = [
+                    "//strong[@class='v2CTKd KaSAf']//div[@dir='ltr']",
+                    "//strong[@class='v2CTKd KaSAf']//div",
+                    "//div[@class='lY6Rwe riHXqb']//strong//div",
+                    "//h2[@class='XfTrZ']//strong//div",
+                    "//article//strong//div[@dir='ltr']"
+                ]
+                
+                for xpath in span_container_xpaths:
+                    try:
+                        container = WebDriverWait(driver, 5).until(
+                            EC.presence_of_element_located((By.XPATH, xpath))
+                        )
+                        spans = container.find_elements(By.TAG_NAME, "span")
+                        if spans:
+                            password_chars = []
+                            for span in spans:
+                                char = span.text.strip()
+                                if char:
+                                    password_chars.append(char)
+                            
+                            if password_chars:
+                                full_password = ''.join(password_chars)
+                                clean_password = full_password.replace(' ', '')
+                                
+                                # Reconstruct dashes if needed
+                                if len(clean_password) >= 16 and '-' not in clean_password:
+                                    if len(clean_password) == 16:
+                                        clean_password = f"{clean_password[:4]}-{clean_password[4:8]}-{clean_password[8:12]}-{clean_password[12:16]}"
+                                
+                                if len(clean_password) >= 16 and (clean_password.count('-') >= 3 or len(clean_password) == 19):
+                                    app_password = clean_password
+                                    logger.info(f"[STEP] Extracted app password from spans: {app_password[:4]}****{app_password[-4:]}")
+                                    break
+                    except:
+                        continue
+                
+                # Fallback to dynamic XPath patterns if span extraction failed (from reference script)
+                if not app_password:
+                    logger.info("[STEP] Span extraction failed, trying dynamic XPath patterns...")
+                    priority_xpaths = [
+                        "//strong[@class='v2CTKd KaSAf']//div[@dir='ltr']",
+                        "//strong[@class='v2CTKd KaSAf']//div",
+                        "//strong[@class='v2CTKd KaSAf']",
+                        "//div[@class='lY6Rwe riHXqb']//strong",
+                        "//h2[@class='XfTrZ']//strong",
+                        "//header[@class='VuF2Pd lY6Rwe']//strong",
+                        "//article//strong[@class='v2CTKd KaSAf']",
+                    ]
+                    
+                    # Add dynamic div patterns (from reference script)
+                    for div_num in range(14, 23):
+                        priority_xpaths.extend([
+                            f"/html/body/div[{div_num}]/div[2]/div/div[1]/div/div[1]/article/header/div/h2/div/strong/div",
+                            f"/html/body/div[{div_num}]/div[2]/div/div[1]/div/div[1]/article/header/div/h2/div/strong",
+                            f"/html/body/div[{div_num}]/div[2]/div/div[1]/div/div[1]/article/header/div/h2/div",
+                            f"/html/body/div[{div_num}]//strong[contains(text(), '-')]",
+                        ])
+                    
+                    for i, xpath in enumerate(priority_xpaths):
+                        try:
+                            element = WebDriverWait(driver, 2).until(
+                                EC.presence_of_element_located((By.XPATH, xpath))
+                            )
+                            potential_password = element.text.strip().replace(" ", "")
+                            if len(potential_password) >= 16 and '-' in potential_password and potential_password.count('-') >= 3:
+                                app_password = potential_password
+                                logger.info(f"[STEP] App password found using XPath #{i+1}: {app_password[:4]}****{app_password[-4:]}")
+                                break
+                        except:
+                            continue
+                
+                if not app_password or len(app_password) < 16:
+                    raise TimeoutException("Failed to locate valid app password element")
+                
+                logger.info("[STEP] App Password generated successfully")
+                return True, app_password, None, None
+                
+            except TimeoutException as e:
+                logger.warning(f"[STEP] Attempt {attempt + 1} failed to generate app password: {e}")
+                if attempt < max_retries - 1:
+                    driver.refresh()
+                    time.sleep(3)
+                else:
+                    raise e
         
-        if not app_name_input:
-            logger.error("[STEP] Could not find app name input field after 3 attempts")
-            return False, None, "APP_NAME_INPUT_NOT_FOUND", "App name input field not found"
-        
-        # Enter app name
-        app_name_input.clear()
-        app_name_input.send_keys(app_name)
-        logger.info(f"[STEP] Entered app name: {app_name}")
-        time.sleep(1)
-        
-        # Click Generate button
-        generate_button_xpaths = [
-            "//button[contains(., 'Generate')]",
-            "//button[contains(., 'CREATE')]",
-            "//span[contains(text(), 'Generate')]/ancestor::button",
-            "//span[contains(text(), 'CREATE')]/ancestor::button",
-        ]
-        
-        for xpath in generate_button_xpaths:
-            if element_exists(driver, xpath, timeout=5):
-                click_xpath(driver, xpath, timeout=10)
-                logger.info(f"[STEP] Clicked Generate button: {xpath}")
-                time.sleep(3)
-                break
-        
-        # Extract the generated app password
-        # It's usually displayed in a format like "abcd efgh ijkl mnop" (16 characters with spaces)
-        app_password_xpaths = [
-            "//div[contains(@class, 'password')]",
-            "//div[contains(@class, 'generated')]",
-            "//strong[contains(@class, 'v2CTKd')]",
-            "//div[contains(text(), '-')]",  # App passwords often contain dashes
-            "//code",
-            "//pre",
-        ]
-        
-        app_password = None
-        for xpath in app_password_xpaths:
-            try:
-                element = wait_for_xpath(driver, xpath, timeout=10)
-                if element:
-                    text = element.text.strip()
-                    # Clean up (remove spaces, keep dashes)
-                    cleaned = text.replace(" ", "")
-                    # App passwords are usually 16-19 characters (16 chars + 3 dashes)
-                    if len(cleaned) >= 16:
-                        app_password = cleaned
-                        logger.info(f"[STEP] Extracted app password: {app_password[:4]}****{app_password[-4:]}")
-                        break
-            except:
-                continue
-        
-        # If not found with standard methods, try looking at all text on page
-        if not app_password:
-            logger.warning("[STEP] Could not find app password with standard xpaths, trying page source...")
-            try:
-                page_source = driver.page_source
-                # Look for pattern like "abcd-efgh-ijkl-mnop"
-                pattern = r'[a-z]{4}-[a-z]{4}-[a-z]{4}-[a-z]{4}'
-                matches = re.findall(pattern, page_source)
-                if matches:
-                    app_password = matches[0]
-                    logger.info(f"[STEP] Found app password in page source: {app_password[:4]}****{app_password[-4:]}")
-            except:
-                pass
-        
-        if not app_password:
-            logger.error("[STEP] Could not extract app password from page")
-            return False, None, "APP_PASSWORD_EXTRACTION_FAILED", "Failed to extract app password"
-        
-        # Click Done to close the dialog
-        done_button_xpaths = [
-            "//button[contains(., 'Done')]",
-            "//button[contains(., 'Close')]",
-            "//span[contains(text(), 'Done')]/ancestor::button",
-        ]
-        
-        for xpath in done_button_xpaths:
-            if element_exists(driver, xpath, timeout=5):
-                click_xpath(driver, xpath, timeout=10)
-                logger.info(f"[STEP] Clicked Done button: {xpath}")
-                break
-        
-        logger.info("[STEP] App Password generated successfully")
-        return True, app_password, None, None
+        logger.error("[STEP] App Password generation failed after all retries")
+        return False, None, "APP_PASSWORD_GENERATION_FAILED", "Failed to generate app password after retries"
     
     except Exception as e:
         logger.error(f"[STEP] App Password generation exception: {e}")
@@ -1594,6 +1713,10 @@ def handler(event, context):
                 "secret_key": secret_key[:4] + "****" + secret_key[-4:] if secret_key else None,
                 "timings": timings
             }
+        
+        # Wait for app password page to be ready (may take up to 30 seconds after enabling 2SV)
+        logger.info("[STEP] Waiting for app password authorization (may take up to 30 seconds)...")
+        time.sleep(5)  # Initial wait
         
         # Step 4: Generate App Password
         step_completed = "app_password"
