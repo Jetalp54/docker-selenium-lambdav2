@@ -374,10 +374,10 @@ def append_app_password_to_s3(email, app_password):
     Append the app password to a global S3 file (app_passwords.txt).
     Environment vars:
       APP_PASSWORDS_S3_BUCKET  (required)
-      APP_PASSWORDS_S3_KEY     (optional, default app_passwords.txt)
+      APP_PASSWORDS_S3_KEY     (optional, default app-passwords.txt)
     """
     bucket = os.environ.get("APP_PASSWORDS_S3_BUCKET")
-    key = os.environ.get("APP_PASSWORDS_S3_KEY", "app_passwords.txt")
+    key = os.environ.get("APP_PASSWORDS_S3_KEY", "app-passwords.txt")
 
     if not bucket:
         logger.error("[S3] APP_PASSWORDS_S3_BUCKET not configured.")
@@ -388,25 +388,49 @@ def append_app_password_to_s3(email, app_password):
         
         # Try to fetch existing file content
         existing_content = ""
+        existing_entries = {}  # Dictionary to track email:password pairs (for duplicate removal)
         try:
             obj = s3.get_object(Bucket=bucket, Key=key)
             existing_content = obj['Body'].read().decode('utf-8')
+            # Parse existing entries (format: email:password)
+            for line in existing_content.strip().split('\n'):
+                if ':' in line:
+                    existing_email, existing_password = line.strip().split(':', 1)
+                    existing_entries[existing_email.strip()] = existing_password.strip()
+            logger.info(f"[S3] Loaded {len(existing_entries)} existing entries from {key}")
         except s3.exceptions.NoSuchKey:
             logger.info(f"[S3] {key} does not exist yet, will create it.")
         except Exception as e:
             logger.warning(f"[S3] Could not read existing file: {e}")
 
-        # Append new entry
-        new_line = f"{email}|{app_password}\n"
-        updated_content = existing_content + new_line
+        # Update or add entry (removes duplicates by email, keeps latest)
+        existing_entries[email] = app_password
+        
+        # Rebuild content from dictionary (ensures no duplicates)
+        updated_content = ""
+        for entry_email, entry_password in sorted(existing_entries.items()):
+            updated_content += f"{entry_email}:{entry_password}\n"
 
         # Write back
-        s3.put_object(Bucket=bucket, Key=key, Body=updated_content.encode('utf-8'))
-        logger.info(f"[S3] App password appended to s3://{bucket}/{key}")
+        s3.put_object(
+            Bucket=bucket, 
+            Key=key, 
+            Body=updated_content.encode('utf-8'),
+            ContentType='text/plain'
+        )
+        logger.info(f"[S3] App password saved to s3://{bucket}/{key} (total entries: {len(existing_entries)})")
         return True, bucket, key
 
+    except s3.exceptions.ClientError as e:
+        error_code = e.response.get('Error', {}).get('Code', '')
+        if error_code == 'AccessDenied':
+            logger.error(f"[S3] Access Denied - Lambda IAM role may not have S3 permissions. Please ensure the role has 'AmazonS3FullAccess' policy attached.")
+        else:
+            logger.error(f"[S3] S3 ClientError: {error_code} - {e}")
+        return False, bucket, key
     except Exception as e:
-        logger.error(f"[S3] Failed to write app_passwords.txt to S3: {e}")
+        logger.error(f"[S3] Failed to write {key} to S3: {e}")
+        logger.error(traceback.format_exc())
         return False, bucket, key
 
 
