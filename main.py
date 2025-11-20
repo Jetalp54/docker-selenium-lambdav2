@@ -365,6 +365,94 @@ def upload_secret_to_sftp(email, secret_key):
 
 
 # =====================================================================
+# S3 upload for App Passwords
+# =====================================================================
+
+
+def append_app_password_to_s3(email, app_password):
+    """
+    Append the app password to a global S3 file (app_passwords.txt).
+    Environment vars:
+      APP_PASSWORDS_S3_BUCKET  (required)
+      APP_PASSWORDS_S3_KEY     (optional, default app-passwords.txt)
+    """
+    bucket = os.environ.get("APP_PASSWORDS_S3_BUCKET")
+    key = os.environ.get("APP_PASSWORDS_S3_KEY", "app-passwords.txt")
+
+    if not bucket:
+        logger.error("[S3] APP_PASSWORDS_S3_BUCKET not configured.")
+        return False, bucket, key
+
+    try:
+        s3 = boto3.client("s3")
+        
+        # Try to fetch existing file content
+        existing_content = ""
+        existing_entries = {}  # Dictionary to track email:password pairs (for duplicate removal)
+        file_exists = False
+        
+        try:
+            obj = s3.get_object(Bucket=bucket, Key=key)
+            existing_content = obj['Body'].read().decode('utf-8')
+            file_exists = True
+            # Parse existing entries (format: email:password)
+            for line in existing_content.strip().split('\n'):
+                if ':' in line and line.strip():
+                    existing_email, existing_password = line.strip().split(':', 1)
+                    existing_entries[existing_email.strip()] = existing_password.strip()
+            logger.info(f"[S3] Loaded {len(existing_entries)} existing entries from {key}")
+        except s3.exceptions.NoSuchKey:
+            logger.info(f"[S3] {key} does not exist yet, will create it.")
+            file_exists = False
+        except s3.exceptions.ClientError as read_err:
+            error_code = read_err.response.get('Error', {}).get('Code', '')
+            if error_code == 'AccessDenied':
+                logger.error(f"[S3] Access Denied when reading {key} - Lambda IAM role may not have S3 permissions.")
+                logger.error(f"[S3] Please click 'Create / Update Production Lambda' in aws.py to ensure IAM role has 'AmazonS3FullAccess' policy.")
+                # Try to write anyway - sometimes write permissions work even if read doesn't
+                logger.warning(f"[S3] Attempting to create/write {key} anyway (may fail if no write permissions)...")
+            else:
+                logger.warning(f"[S3] Could not read existing file ({error_code}): {read_err}")
+        except Exception as e:
+            logger.warning(f"[S3] Could not read existing file: {e}")
+
+        # Update or add entry (removes duplicates by email, keeps latest)
+        existing_entries[email] = app_password
+        
+        # Rebuild content from dictionary (ensures no duplicates)
+        updated_content = ""
+        for entry_email, entry_password in sorted(existing_entries.items()):
+            updated_content += f"{entry_email}:{entry_password}\n"
+
+        # Write back (create file if it doesn't exist)
+        try:
+            s3.put_object(
+                Bucket=bucket, 
+                Key=key, 
+                Body=updated_content.encode('utf-8'),
+                ContentType='text/plain'
+            )
+            action = "created" if not file_exists else "updated"
+            logger.info(f"[S3] App password saved to s3://{bucket}/{key} ({action}, total entries: {len(existing_entries)})")
+            return True, bucket, key
+        except s3.exceptions.ClientError as write_err:
+            error_code = write_err.response.get('Error', {}).get('Code', '')
+            if error_code == 'AccessDenied':
+                logger.error(f"[S3] Access Denied when writing to {key}")
+                logger.error(f"[S3] CRITICAL: Lambda IAM role does not have S3 write permissions!")
+                logger.error(f"[S3] ACTION REQUIRED: Click 'Create / Update Production Lambda' in aws.py to attach 'AmazonS3FullAccess' policy to the IAM role.")
+                logger.error(f"[S3] The Lambda role name is: edu-gw-app-password-lambda-role")
+            else:
+                logger.error(f"[S3] S3 ClientError when writing ({error_code}): {write_err}")
+            return False, bucket, key
+
+    except Exception as e:
+        logger.error(f"[S3] Failed to write {key} to S3: {e}")
+        logger.error(traceback.format_exc())
+        return False, bucket, key
+
+
+# =====================================================================
 # Step 1: Login + optional existing 2FA handling
 # =====================================================================
 
@@ -1689,6 +1777,14 @@ def handler(event, context):
                 "secret_key": secret_key[:4] + "****" + secret_key[-4:] if secret_key else None,
                 "timings": timings
             }
+        
+        # Step 4.5: Append App Password to S3
+        step_start = time.time()
+        s3_success, s3_bucket, s3_key = append_app_password_to_s3(email, app_password)
+        timings["s3_upload"] = round(time.time() - step_start, 2)
+        
+        if not s3_success:
+            logger.warning("[S3] Could not upload app password to S3, continuing anyway...")
         
         # All steps completed successfully
         step_completed = "completed"
