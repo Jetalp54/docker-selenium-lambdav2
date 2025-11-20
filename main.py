@@ -1635,12 +1635,12 @@ def save_to_dynamodb(email, app_password, secret_key=None):
     
     try:
         import boto3
-        from datetime import datetime
         
         dynamodb = boto3.resource("dynamodb")
         table = dynamodb.Table(table_name)
         
-        timestamp = datetime.utcnow().isoformat() + "Z"
+        # Use Unix timestamp (integer) for better DynamoDB performance and querying
+        timestamp = int(time.time())
         
         item = {
             "email": email,
