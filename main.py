@@ -40,6 +40,28 @@ logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
 # =====================================================================
+# Global boto3 clients/resources (reused across invocations for better performance)
+# =====================================================================
+
+# Lazy initialization of boto3 clients/resources
+_dynamodb_resource = None
+_s3_client = None
+
+def get_dynamodb_resource():
+    """Get or create DynamoDB resource (reused across invocations)"""
+    global _dynamodb_resource
+    if _dynamodb_resource is None:
+        _dynamodb_resource = boto3.resource("dynamodb")
+    return _dynamodb_resource
+
+def get_s3_client():
+    """Get or create S3 client (reused across invocations)"""
+    global _s3_client
+    if _s3_client is None:
+        _s3_client = boto3.client("s3")
+    return _s3_client
+
+# =====================================================================
 # Chrome Driver Initialization for AWS Lambda (with anti-detection)
 # =====================================================================
 
@@ -384,7 +406,7 @@ def append_app_password_to_s3(email, app_password):
         return False, bucket, key
 
     try:
-        s3 = boto3.client("s3")
+        s3 = get_s3_client()  # Use shared client for better connection pooling
         
         # Try to fetch existing file content
         existing_content = ""
@@ -1634,9 +1656,8 @@ def save_to_dynamodb(email, app_password, secret_key=None):
     table_name = os.environ.get("DYNAMODB_TABLE_NAME", "gbot-app-passwords")
     
     try:
-        import boto3
-        
-        dynamodb = boto3.resource("dynamodb")
+        # Use shared DynamoDB resource for better connection pooling and performance
+        dynamodb = get_dynamodb_resource()
         table = dynamodb.Table(table_name)
         
         # Use Unix timestamp (integer) for better DynamoDB performance and querying
