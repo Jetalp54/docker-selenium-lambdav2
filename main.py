@@ -1621,6 +1621,50 @@ def generate_app_password(driver, email):
 
 
 # =====================================================================
+# DynamoDB Storage
+# =====================================================================
+
+def save_to_dynamodb(email, app_password, secret_key=None):
+    """
+    Save app password to DynamoDB for reliable storage and retrieval.
+    Table: gbot-app-passwords
+    Primary Key: email
+    Attributes: email, app_password, secret_key, created_at, updated_at
+    """
+    table_name = os.environ.get("DYNAMODB_TABLE_NAME", "gbot-app-passwords")
+    
+    try:
+        import boto3
+        from datetime import datetime
+        
+        dynamodb = boto3.resource("dynamodb")
+        table = dynamodb.Table(table_name)
+        
+        timestamp = datetime.utcnow().isoformat() + "Z"
+        
+        item = {
+            "email": email,
+            "app_password": app_password,
+            "created_at": timestamp,
+            "updated_at": timestamp
+        }
+        
+        # Add secret_key if provided (masked for security)
+        if secret_key:
+            item["secret_key"] = secret_key[:4] + "****" + secret_key[-4:]
+        
+        # Put item (upsert - creates or updates)
+        table.put_item(Item=item)
+        
+        logger.info(f"[DYNAMODB] Successfully saved {email} to {table_name}")
+        return True
+        
+    except Exception as e:
+        logger.error(f"[DYNAMODB] Failed to save {email}: {e}")
+        logger.error(f"[DYNAMODB] Traceback: {traceback.format_exc()}")
+        return False
+
+# =====================================================================
 # Lambda Handler
 # =====================================================================
 
@@ -1778,13 +1822,15 @@ def handler(event, context):
                 "timings": timings
             }
         
-        # Step 4.5: Append App Password to S3
+        # Step 4.5: Save App Password to DynamoDB
         step_start = time.time()
-        s3_success, s3_bucket, s3_key = append_app_password_to_s3(email, app_password)
-        timings["s3_upload"] = round(time.time() - step_start, 2)
+        dynamo_success = save_to_dynamodb(email, app_password, secret_key)
+        timings["dynamodb_save"] = round(time.time() - step_start, 2)
         
-        if not s3_success:
-            logger.warning("[S3] Could not upload app password to S3, continuing anyway...")
+        if dynamo_success:
+            logger.info(f"[DYNAMODB] ✓ Password saved successfully for {email}")
+        else:
+            logger.warning(f"[DYNAMODB] ⚠️ Could not save to DynamoDB for {email}, continuing anyway...")
         
         # All steps completed successfully
         step_completed = "completed"
