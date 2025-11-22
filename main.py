@@ -1614,13 +1614,22 @@ def handler(event, context):
     """
     AWS Lambda handler function.
     
-    Expected event format:
+    Expected event format (single user - backward compatible):
     {
         "email": "user@example.com",
         "password": "userpassword"
     }
     
-    Returns JSON with status, step_completed, error info, app_password, secret_key, and timings.
+    Expected event format (batch processing - up to 10 users):
+    {
+        "users": [
+            {"email": "user1@example.com", "password": "password1"},
+            {"email": "user2@example.com", "password": "password2"},
+            ...
+        ]
+    }
+    
+    Returns JSON with status, results (for batch) or single user fields (for backward compatibility).
     """
     start_time = time.time()
     timings = {}
@@ -1632,20 +1641,92 @@ def handler(event, context):
     logger.info(f"[LAMBDA] Context: {context}")
     logger.info("=" * 60)
     
-    # Extract email and password from event
-    email = event.get("email", os.environ.get("GW_EMAIL"))
-    password = event.get("password", os.environ.get("GW_PASSWORD"))
+    # Check if this is a batch request (new format) or single user (backward compatible)
+    users_batch = event.get("users")
     
-    if not email or not password:
+    if users_batch:
+        # Batch processing mode (up to 10 users)
+        if not isinstance(users_batch, list):
+            return {
+                "status": "failed",
+                "error_message": "Invalid 'users' field - must be a list",
+                "results": []
+            }
+        
+        if len(users_batch) > 10:
+            return {
+                "status": "failed",
+                "error_message": f"Too many users in batch: {len(users_batch)}. Maximum is 10.",
+                "results": []
+            }
+        
+        logger.info(f"[LAMBDA] Batch processing mode: {len(users_batch)} user(s)")
+        
+        # Process each user sequentially (Selenium can only handle one browser session)
+        results = []
+        for idx, user_data in enumerate(users_batch):
+            email = user_data.get("email", "").strip()
+            password = user_data.get("password", "").strip()
+            
+            if not email or not password:
+                results.append({
+                    "email": email or "unknown",
+                    "status": "failed",
+                    "error_message": "Email or password not provided",
+                    "app_password": None,
+                    "secret_key": None
+                })
+                continue
+            
+            logger.info(f"[LAMBDA] Processing user {idx + 1}/{len(users_batch)}: {email}")
+            user_result = process_single_user(email, password, start_time)
+            results.append(user_result)
+        
+        # Calculate total time
+        total_time = round(time.time() - start_time, 2)
+        
+        # Count successes and failures
+        success_count = sum(1 for r in results if r.get("status") == "success")
+        failed_count = len(results) - success_count
+        
+        logger.info(f"[LAMBDA] Batch processing completed: {success_count} success, {failed_count} failed in {total_time}s")
+        
         return {
-            "status": "failed",
-            "step_completed": "init",
-            "error_step": "init",
-            "error_message": "Email or password not provided in event or environment",
-            "app_password": None,
-            "secret_key": None,
-            "timings": timings
+            "status": "completed",
+            "batch_size": len(users_batch),
+            "success_count": success_count,
+            "failed_count": failed_count,
+            "total_time": total_time,
+            "results": results
         }
+    
+    else:
+        # Single user mode (backward compatible)
+        email = event.get("email", os.environ.get("GW_EMAIL"))
+        password = event.get("password", os.environ.get("GW_PASSWORD"))
+        
+        if not email or not password:
+            return {
+                "status": "failed",
+                "step_completed": "init",
+                "error_step": "init",
+                "error_message": "Email or password not provided in event or environment",
+                "app_password": None,
+                "secret_key": None,
+                "timings": timings
+            }
+        
+        logger.info(f"[LAMBDA] Single user mode: {email}")
+        return process_single_user(email, password, start_time)
+
+
+def process_single_user(email, password, batch_start_time=None):
+    """
+    Process a single user account through all steps.
+    Returns result dictionary with status, app_password, secret_key, etc.
+    """
+    user_start_time = time.time() if batch_start_time is None else batch_start_time
+    timings = {}
     
     driver = None
     secret_key = None
@@ -1670,6 +1751,7 @@ def handler(event, context):
         if not success:
             logger.error(f"[STEP] Login failed: {error_message}")
             return {
+                "email": email,
                 "status": "failed",
                 "step_completed": step_completed,
                 "error_step": step_completed,
@@ -1688,6 +1770,7 @@ def handler(event, context):
         if not success:
             logger.error(f"[STEP] Authenticator setup failed: {error_message}")
             return {
+                "email": email,
                 "status": "failed",
                 "step_completed": step_completed,
                 "error_step": step_completed,
@@ -1714,6 +1797,7 @@ def handler(event, context):
         if not success:
             logger.error(f"[STEP] Authenticator verification failed: {error_message}")
             return {
+                "email": email,
                 "status": "failed",
                 "step_completed": step_completed,
                 "error_step": step_completed,
@@ -1732,6 +1816,7 @@ def handler(event, context):
         if not success:
             logger.error(f"[STEP] 2-Step Verification enable failed: {error_message}")
             return {
+                "email": email,
                 "status": "failed",
                 "step_completed": step_completed,
                 "error_step": step_completed,
@@ -1754,6 +1839,7 @@ def handler(event, context):
         if not success:
             logger.error(f"[STEP] App Password generation failed: {error_message}")
             return {
+                "email": email,
                 "status": "failed",
                 "step_completed": step_completed,
                 "error_step": step_completed,
@@ -1775,12 +1861,13 @@ def handler(event, context):
         
         # All steps completed successfully
         step_completed = "completed"
-        total_time = round(time.time() - start_time, 2)
+        total_time = round(time.time() - user_start_time, 2)
         timings["total"] = total_time
         
         logger.info(f"[LAMBDA] All steps completed successfully for {email} in {total_time} seconds")
         
         return {
+            "email": email,
             "status": "success",
             "step_completed": step_completed,
             "error_step": None,
@@ -1791,13 +1878,14 @@ def handler(event, context):
         }
     
     except Exception as e:
-        logger.error(f"[LAMBDA] Unhandled exception: {e}")
+        logger.error(f"[LAMBDA] Unhandled exception for {email}: {e}")
         logger.error(traceback.format_exc())
         
-        total_time = round(time.time() - start_time, 2)
+        total_time = round(time.time() - user_start_time, 2)
         timings["total"] = total_time
         
         return {
+            "email": email,
             "status": "failed",
             "step_completed": step_completed,
             "error_step": step_completed,
@@ -1812,6 +1900,6 @@ def handler(event, context):
         if driver:
             try:
                 driver.quit()
-                logger.info("[LAMBDA] Chrome driver closed")
+                logger.info(f"[LAMBDA] Chrome driver closed for {email}")
             except:
                 pass
