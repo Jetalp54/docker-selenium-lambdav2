@@ -20,9 +20,11 @@ import string
 import logging
 import traceback
 import subprocess
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # 3rd-party libraries
 import boto3
+from botocore.exceptions import ClientError
 import paramiko
 import pyotp
 
@@ -48,10 +50,17 @@ _dynamodb_resource = None
 _s3_client = None
 
 def get_dynamodb_resource():
-    """Get or create DynamoDB resource (reused across invocations)"""
+    """Get or create DynamoDB resource (reused across invocations)
+    Uses a fixed region (eu-west-1) so all Lambda functions save to the same table
+    This saves resources by having 1 table instead of 1 per region
+    """
     global _dynamodb_resource
     if _dynamodb_resource is None:
-        _dynamodb_resource = boto3.resource("dynamodb")
+        # Use fixed region for DynamoDB - all Lambda functions save to same table
+        # This saves resources (1 table instead of 17 tables)
+        dynamodb_region = os.environ.get("DYNAMODB_REGION", "eu-west-1")
+        _dynamodb_resource = boto3.resource("dynamodb", region_name=dynamodb_region)
+        logger.info(f"[DYNAMODB] Using DynamoDB region: {dynamodb_region} (centralized storage)")
     return _dynamodb_resource
 
 def get_s3_client():
@@ -1566,12 +1575,67 @@ def generate_app_password(driver, email):
 # DynamoDB Storage
 # =====================================================================
 
+def ensure_dynamodb_table_exists(table_name="gbot-app-passwords"):
+    """
+    Ensure DynamoDB table exists. Creates it if it doesn't exist.
+    Uses a fixed region (eu-west-1) so all Lambda functions use the same table.
+    Returns True if table exists or was created, False on error.
+    Note: Table creation is asynchronous, so we don't wait for it to be active.
+    """
+    try:
+        # Use fixed region for DynamoDB - centralized storage
+        dynamodb_region = os.environ.get("DYNAMODB_REGION", "eu-west-1")
+        dynamodb_client = boto3.client("dynamodb", region_name=dynamodb_region)
+        
+        # Check if table exists
+        try:
+            dynamodb_client.describe_table(TableName=table_name)
+            logger.info(f"[DYNAMODB] Table {table_name} already exists")
+            return True
+        except ClientError as e:
+            if e.response['Error']['Code'] != 'ResourceNotFoundException':
+                logger.error(f"[DYNAMODB] Error checking table {table_name}: {e}")
+                return False
+            
+            # Table doesn't exist, create it
+            logger.info(f"[DYNAMODB] Table {table_name} not found. Creating...")
+            try:
+                dynamodb_client.create_table(
+                    TableName=table_name,
+                    KeySchema=[
+                        {'AttributeName': 'email', 'KeyType': 'HASH'}  # Partition key
+                    ],
+                    AttributeDefinitions=[
+                        {'AttributeName': 'email', 'AttributeType': 'S'}
+                    ],
+                    BillingMode='PAY_PER_REQUEST'  # On-demand pricing (no provisioned capacity)
+                )
+                logger.info(f"[DYNAMODB] ✓ Table {table_name} creation initiated (will be active in ~10-30 seconds)")
+                # Don't wait for table to be active - it's asynchronous
+                # The first save attempt might fail, but subsequent attempts will succeed
+                return True
+            except ClientError as create_error:
+                if create_error.response['Error']['Code'] == 'ResourceInUseException':
+                    # Table is being created by another process, that's fine
+                    logger.info(f"[DYNAMODB] Table {table_name} is being created by another process")
+                    return True
+                else:
+                    logger.error(f"[DYNAMODB] Failed to create table {table_name}: {create_error}")
+                    return False
+                    
+    except Exception as e:
+        logger.error(f"[DYNAMODB] Exception ensuring table exists: {e}")
+        logger.error(f"[DYNAMODB] Traceback: {traceback.format_exc()}")
+        return False
+
 def save_to_dynamodb(email, app_password, secret_key=None):
     """
     Save app password to DynamoDB for reliable storage and retrieval.
     Table: gbot-app-passwords
     Primary Key: email
     Attributes: email, app_password, secret_key, created_at, updated_at
+    
+    Automatically creates the table if it doesn't exist.
     """
     table_name = os.environ.get("DYNAMODB_TABLE_NAME", "gbot-app-passwords")
     
@@ -1599,6 +1663,36 @@ def save_to_dynamodb(email, app_password, secret_key=None):
         
         logger.info(f"[DYNAMODB] Successfully saved {email} to {table_name}")
         return True
+        
+    except ClientError as e:
+        error_code = e.response.get('Error', {}).get('Code', '')
+        
+        if error_code == 'ResourceNotFoundException':
+            # Table doesn't exist, try to create it
+            logger.warning(f"[DYNAMODB] Table {table_name} not found. Attempting to create...")
+            if ensure_dynamodb_table_exists(table_name):
+                # Wait a moment for table to become available (if just created)
+                time.sleep(2)
+                # Retry the save operation
+                try:
+                    table = dynamodb.Table(table_name)
+                    table.put_item(Item=item)
+                    logger.info(f"[DYNAMODB] Successfully saved {email} to {table_name} after table creation")
+                    return True
+                except Exception as retry_error:
+                    logger.error(f"[DYNAMODB] Failed to save {email} after table creation: {retry_error}")
+                    logger.error(f"[DYNAMODB] ⚠️ Table {table_name} may still be initializing. Please wait 10-30 seconds and retry.")
+                    return False
+            else:
+                logger.error(f"[DYNAMODB] Failed to create table {table_name}. Please create it manually in AWS Console.")
+                logger.error(f"[DYNAMODB] Table name: {table_name}")
+                logger.error(f"[DYNAMODB] Primary key: email (String)")
+                logger.error(f"[DYNAMODB] Billing mode: PAY_PER_REQUEST")
+                return False
+        else:
+            logger.error(f"[DYNAMODB] Failed to save {email}: {e}")
+            logger.error(f"[DYNAMODB] Error code: {error_code}")
+            return False
         
     except Exception as e:
         logger.error(f"[DYNAMODB] Failed to save {email}: {e}")
@@ -1661,26 +1755,90 @@ def handler(event, context):
             }
         
         logger.info(f"[LAMBDA] Batch processing mode: {len(users_batch)} user(s)")
+        logger.info(f"[LAMBDA] Starting PARALLEL processing of {len(users_batch)} user(s)")
         
-        # Process each user sequentially (Selenium can only handle one browser session)
+        # Ensure DynamoDB table exists before processing
+        table_name = os.environ.get("DYNAMODB_TABLE_NAME", "gbot-app-passwords")
+        logger.info(f"[LAMBDA] Ensuring DynamoDB table exists: {table_name}")
+        ensure_dynamodb_table_exists(table_name)
+        
+        # Process all users in PARALLEL - each user gets their own Chrome driver instance
         results = []
-        for idx, user_data in enumerate(users_batch):
+        
+        def process_user_wrapper(user_data, idx):
+            """Wrapper function to process a single user with proper error handling"""
             email = user_data.get("email", "").strip()
             password = user_data.get("password", "").strip()
             
             if not email or not password:
-                results.append({
+                return {
                     "email": email or "unknown",
                     "status": "failed",
                     "error_message": "Email or password not provided",
                     "app_password": None,
                     "secret_key": None
-                })
-                continue
+                }
             
-            logger.info(f"[LAMBDA] Processing user {idx + 1}/{len(users_batch)}: {email}")
-            user_result = process_single_user(email, password, start_time)
-            results.append(user_result)
+            # Stagger Chrome initialization to avoid resource contention
+            # Each thread waits a bit before starting to spread out resource usage
+            # This prevents all Chrome instances from initializing at exactly the same time
+            stagger_delay = idx * 1.0  # 1 second between each Chrome start
+            if stagger_delay > 0:
+                logger.info(f"[LAMBDA] [THREAD] Staggering Chrome start for user {idx + 1}: waiting {stagger_delay}s")
+                time.sleep(stagger_delay)
+            
+            logger.info(f"[LAMBDA] [THREAD] Starting parallel processing of user {idx + 1}/{len(users_batch)}: {email}")
+            try:
+                user_result = process_single_user(email, password, start_time)
+                logger.info(f"[LAMBDA] [THREAD] Completed user {idx + 1}/{len(users_batch)}: {email} - Status: {user_result.get('status', 'unknown')}")
+                return user_result
+            except Exception as e:
+                logger.error(f"[LAMBDA] [THREAD] Exception processing user {idx + 1}/{len(users_batch)}: {email} - {str(e)}")
+                logger.error(f"[LAMBDA] [THREAD] Traceback: {traceback.format_exc()}")
+                return {
+                    "email": email,
+                    "status": "failed",
+                    "error_message": f"Exception during processing: {str(e)}",
+                    "app_password": None,
+                    "secret_key": None
+                }
+        
+        # Use ThreadPoolExecutor to process users in parallel
+        # Limit concurrent workers to avoid resource exhaustion in Lambda
+        # Each Chrome instance uses ~200-300 MB, so 3 concurrent instances is safe for 2048 MB Lambda
+        # Running more than 3 simultaneously causes renderer timeouts due to resource contention
+        max_concurrent = min(3, len(users_batch))  # Max 3 concurrent Chrome instances
+        logger.info(f"[LAMBDA] Using {max_concurrent} concurrent workers for {len(users_batch)} users (to avoid resource exhaustion)")
+        
+        with ThreadPoolExecutor(max_workers=max_concurrent) as executor:
+            # Submit all tasks
+            future_to_user = {
+                executor.submit(process_user_wrapper, user_data, idx): (idx, user_data)
+                for idx, user_data in enumerate(users_batch)
+            }
+            
+            # Collect results as they complete (maintain order)
+            completed_results = {}
+            for future in as_completed(future_to_user):
+                idx, user_data = future_to_user[future]
+                try:
+                    result = future.result()
+                    completed_results[idx] = result
+                except Exception as e:
+                    email = user_data.get("email", "unknown")
+                    logger.error(f"[LAMBDA] [THREAD] Future exception for user {idx + 1}: {email} - {str(e)}")
+                    completed_results[idx] = {
+                        "email": email,
+                        "status": "failed",
+                        "error_message": f"Future exception: {str(e)}",
+                        "app_password": None,
+                        "secret_key": None
+                    }
+            
+            # Reconstruct results in original order
+            results = [completed_results[idx] for idx in sorted(completed_results.keys())]
+        
+        logger.info(f"[LAMBDA] All {len(users_batch)} users processed in parallel")
         
         # Calculate total time
         total_time = round(time.time() - start_time, 2)
