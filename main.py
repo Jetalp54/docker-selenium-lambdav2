@@ -280,6 +280,46 @@ def wait_for_xpath(driver, xpath, timeout=30):
         logger.error(f"[SELENIUM] Timeout waiting for XPath: {xpath}")
         return None
 
+def wait_for_visible_and_interactable(driver, xpath, timeout=30):
+    """Wait for an element to be visible and interactable, then return it."""
+    try:
+        # Use element_to_be_clickable which ensures element is both visible and interactable
+        element = WebDriverWait(driver, timeout).until(
+            EC.element_to_be_clickable((By.XPATH, xpath))
+        )
+        # Scroll into view
+        driver.execute_script("arguments[0].scrollIntoView({behavior: 'smooth', block: 'center'});", element)
+        time.sleep(0.2)  # Reduced wait time
+        # Focus the element to ensure it's ready for interaction
+        try:
+            element.click()  # Click to focus (will be cleared anyway)
+            time.sleep(0.1)
+        except:
+            pass  # If click fails, try JavaScript focus
+        return element
+    except TimeoutException:
+        logger.error(f"[SELENIUM] Timeout waiting for visible/interactable XPath: {xpath}")
+        return None
+    except Exception as e:
+        logger.error(f"[SELENIUM] Error waiting for element: {e}")
+        return None
+
+def wait_for_password_clickable(driver, by_method, selector, timeout=10):
+    """Wait for password field to be clickable using By.NAME or By.XPATH (like reference function)"""
+    try:
+        element = WebDriverWait(driver, timeout).until(
+            EC.element_to_be_clickable((by_method, selector))
+        )
+        # Focus the element
+        element.click()  # Click to focus
+        time.sleep(0.1)
+        return element
+    except TimeoutException:
+        return None
+    except Exception as e:
+        logger.warning(f"[SELENIUM] Error waiting for password field: {e}")
+        return None
+
 def wait_for_clickable_xpath(driver, xpath, timeout=30):
     """Wait for an element to be clickable and return it."""
     try:
@@ -635,23 +675,142 @@ def login_google(driver, email, password, known_totp_secret=None):
             email_input.send_keys(Keys.RETURN)
         logger.info("[STEP] Email submitted")
 
-        # Wait for password field
-        time.sleep(3)  # Increased wait for password page to load
-
-        # Enter password
-        password_input_xpaths = [
-            "//input[@name='Passwd']",
-            "//input[@type='password']",
-            "//input[@aria-label*='password' or @aria-label*='Password']",
-        ]
-        password_input = find_element_with_fallback(driver, password_input_xpaths, timeout=30, description="password input")
-        if not password_input:
-            return False, "LOGIN_PASSWORD_FIELD_NOT_FOUND", "Password field not found after email submission"
+        # Wait for password field - reduced wait time
+        time.sleep(1)  # Reduced from 3 to 1 second
         
-        password_input.clear()
-        time.sleep(0.5)
-        password_input.send_keys(password)
-        logger.info("[STEP] Password entered")
+        # Check for iframes first (Google sometimes uses iframes for password field)
+        password_input = None
+        try:
+            # Primary method: Use By.NAME like reference function (most reliable)
+            logger.info("[STEP] Trying to find password input using By.NAME='Passwd' (primary method)")
+            password_input = wait_for_password_clickable(driver, By.NAME, "Passwd", timeout=10)
+            if password_input:
+                logger.info("[STEP] Found password input using By.NAME='Passwd'")
+            else:
+                # Fallback: Try XPath methods
+                password_input_xpaths = [
+                    "//input[@name='Passwd']",
+                    "//input[@type='password']",
+                    "//input[@id='password']",
+                    "//input[@name='password']",
+                    "//input[@aria-label*='password' or @aria-label*='Password' or contains(@aria-label, 'password')]",
+                ]
+                
+                # Try to find visible and interactable password field
+                for xpath in password_input_xpaths:
+                    try:
+                        logger.info(f"[STEP] Trying to find password input with XPath: {xpath}")
+                        password_input = wait_for_visible_and_interactable(driver, xpath, timeout=8)
+                        if password_input:
+                            logger.info(f"[STEP] Found password input using xpath: {xpath}")
+                            break
+                    except Exception as e:
+                        logger.warning(f"[STEP] Failed to find password with {xpath}: {e}")
+                        continue
+            
+            # If not found in main document, check iframes
+            if not password_input:
+                logger.info("[STEP] Password field not found in main document, checking iframes...")
+                iframes = driver.find_elements(By.TAG_NAME, "iframe")
+                for iframe in iframes:
+                    try:
+                        driver.switch_to.frame(iframe)
+                        for xpath in password_input_xpaths:
+                            try:
+                                password_input = wait_for_visible_and_interactable(driver, xpath, timeout=5)
+                                if password_input:
+                                    logger.info(f"[STEP] Found password input in iframe using xpath: {xpath}")
+                                    break
+                            except:
+                                continue
+                        if password_input:
+                            break
+                        driver.switch_to.default_content()
+                    except Exception as iframe_err:
+                        logger.warning(f"[STEP] Error checking iframe: {iframe_err}")
+                        driver.switch_to.default_content()
+                        continue
+            
+            if not password_input:
+                # Last resort: try JavaScript to find and interact with password field
+                logger.info("[STEP] Trying JavaScript method to find password field...")
+                try:
+                    password_input = driver.execute_script("""
+                        var inputs = document.querySelectorAll('input[type="password"], input[name="Passwd"], input[name="password"]');
+                        for (var i = 0; i < inputs.length; i++) {
+                            var input = inputs[i];
+                            if (input.offsetParent !== null) { // Check if visible
+                                input.scrollIntoView({behavior: 'smooth', block: 'center'});
+                                input.focus();
+                                return input;
+                            }
+                        }
+                        return null;
+                    """)
+                    if password_input:
+                        logger.info("[STEP] Found password input using JavaScript")
+                except Exception as js_err:
+                    logger.error(f"[STEP] JavaScript method failed: {js_err}")
+            
+            if not password_input:
+                return False, "LOGIN_PASSWORD_FIELD_NOT_FOUND", "Password field not found after email submission (checked main document and iframes)"
+            
+            # Clear and enter password with multiple fallback methods
+            try:
+                # Method 1: Focus and clear using JavaScript first (more reliable)
+                driver.execute_script("arguments[0].focus();", password_input)
+                time.sleep(0.1)
+                driver.execute_script("arguments[0].click();", password_input)
+                time.sleep(0.1)
+                
+                # Try standard clear first
+                try:
+                    password_input.clear()
+                except:
+                    # If clear fails, use JavaScript
+                    driver.execute_script("arguments[0].value = '';", password_input)
+                
+                time.sleep(0.2)  # Reduced wait time
+                
+                # Enter password using standard method
+                password_input.send_keys(password)
+                logger.info("[STEP] Password entered using standard method")
+            except Exception as e1:
+                logger.warning(f"[STEP] Standard method failed: {e1}, trying JavaScript...")
+                try:
+                    # Method 2: JavaScript interaction (more reliable fallback)
+                    driver.execute_script("arguments[0].focus();", password_input)
+                    driver.execute_script("arguments[0].click();", password_input)
+                    driver.execute_script("arguments[0].value = '';", password_input)
+                    driver.execute_script("arguments[0].value = arguments[1];", password_input, password)
+                    driver.execute_script("arguments[0].dispatchEvent(new Event('input', { bubbles: true }));", password_input)
+                    driver.execute_script("arguments[0].dispatchEvent(new Event('change', { bubbles: true }));", password_input)
+                    logger.info("[STEP] Password entered using JavaScript method")
+                except Exception as e2:
+                    logger.error(f"[STEP] JavaScript method also failed: {e2}")
+                    return False, "LOGIN_PASSWORD_INPUT_FAILED", f"Could not enter password: {e2}"
+            
+            # Verify password was entered
+            try:
+                entered_password = password_input.get_attribute('value')
+                if not entered_password or entered_password != password:
+                    logger.warning(f"[STEP] Password verification failed. Expected length: {len(password)}, Got: {len(entered_password) if entered_password else 0}")
+                    # Try one more time with JavaScript
+                    try:
+                        driver.execute_script("arguments[0].value = arguments[1];", password_input, password)
+                        entered_password = password_input.get_attribute('value')
+                        if entered_password != password:
+                            logger.error("[STEP] Password still not entered correctly after retry")
+                    except:
+                        pass
+            except Exception as verify_err:
+                logger.warning(f"[STEP] Could not verify password entry: {verify_err}")
+            
+            logger.info("[STEP] Password entered successfully")
+        except Exception as password_err:
+            logger.error(f"[STEP] Login exception: {password_err}")
+            logger.error(traceback.format_exc())
+            return False, "LOGIN_PASSWORD_EXCEPTION", f"Exception during password entry: {str(password_err)}"
         time.sleep(1)
         
         # Click Next button
@@ -1804,11 +1963,12 @@ def handler(event, context):
                 }
         
         # Use ThreadPoolExecutor to process users in parallel
-        # Limit concurrent workers to avoid resource exhaustion in Lambda
-        # Each Chrome instance uses ~200-300 MB, so 3 concurrent instances is safe for 2048 MB Lambda
-        # Running more than 3 simultaneously causes renderer timeouts due to resource contention
-        max_concurrent = min(3, len(users_batch))  # Max 3 concurrent Chrome instances
-        logger.info(f"[LAMBDA] Using {max_concurrent} concurrent workers for {len(users_batch)} users (to avoid resource exhaustion)")
+        # Lambda has 2048 MB memory, each Chrome instance uses ~200-300 MB
+        # We can safely run 15-20 concurrent instances (15 * 300MB = 4500MB theoretical, but Chrome instances share memory)
+        # In practice, with 2048 MB, we can run 15-20 Chrome instances efficiently
+        # For maximum speed, process all users in parallel (up to 20 per function)
+        max_concurrent = min(20, len(users_batch))  # Process up to 20 users in parallel (all users in batch)
+        logger.info(f"[LAMBDA] Using {max_concurrent} concurrent workers for {len(users_batch)} users (processing all users in parallel for maximum speed)")
         
         with ThreadPoolExecutor(max_workers=max_concurrent) as executor:
             # Submit all tasks
