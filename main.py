@@ -220,7 +220,7 @@ def get_chrome_driver():
             # Enhanced anti-detection script with multiple techniques
             anti_detection_script = '''
                 // Hide webdriver property
-                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+                    Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
                 
                 // Spoof plugins
                 Object.defineProperty(navigator, 'plugins', {
@@ -241,7 +241,7 @@ def get_chrome_driver():
                 });
                 
                 // Add chrome runtime
-                window.chrome = {runtime: {}};
+                    window.chrome = {runtime: {}};
                 
                 // Spoof permissions
                 const originalQuery = window.navigator.permissions.query;
@@ -954,34 +954,37 @@ def login_google(driver, email, password, known_totp_secret=None):
             password_input = wait_for_password_clickable(driver, By.NAME, "Passwd", timeout=10)
             if password_input:
                 logger.info("[STEP] Found password input using By.NAME='Passwd'")
-            else:
-                # Fallback: Try XPath methods (fixed invalid XPath syntax)
-                password_input_xpaths = [
-                    "//input[@name='Passwd']",
-                    "//input[@type='password']",
-                    "/html/body/div[2]/div[1]/div[1]/div[2]/c-wiz/main/div[2]/div/div/div/form/span/section[2]/div/div/div[1]/div[1]/div/div/div/div/div[1]/div/div[1]/input",  # User-provided working XPath
-                    "//input[@id='password']",
-                    "//input[@name='password']",
-                    "//input[@aria-label*='password']",
-                    "//input[@aria-label*='Password']",
-                    "//input[contains(@aria-label, 'password')]",
-                    "//input[contains(@aria-label, 'Password')]",
-                ]
-                
-                # Try to find visible and interactable password field
-                for xpath in password_input_xpaths:
-                    try:
-                        logger.info(f"[STEP] Trying to find password input with XPath: {xpath}")
-                        password_input = wait_for_visible_and_interactable(driver, xpath, timeout=8)
-                        if password_input:
-                            logger.info(f"[STEP] Found password input using xpath: {xpath}")
-                            break
-                    except Exception as e:
-                        logger.warning(f"[STEP] Failed to find password with {xpath}: {e}")
-                        continue
+        except Exception as primary_err:
+            logger.warning(f"[STEP] Primary method failed: {primary_err}")
+        
+        if not password_input:
+            # Fallback: Try XPath methods (fixed invalid XPath syntax)
+            password_input_xpaths = [
+                "//input[@name='Passwd']",
+                "//input[@type='password']",
+                "/html/body/div[2]/div[1]/div[1]/div[2]/c-wiz/main/div[2]/div/div/div/form/span/section[2]/div/div/div[1]/div[1]/div/div/div/div/div[1]/div/div[1]/input",  # User-provided working XPath
+                "//input[@id='password']",
+                "//input[@name='password']",
+                "//input[@aria-label*='password']",
+                "//input[@aria-label*='Password']",
+                "//input[contains(@aria-label, 'password')]",
+                "//input[contains(@aria-label, 'Password')]",
+            ]
             
-            # If not found in main document, check iframes
-            if not password_input:
+            # Try to find visible and interactable password field
+            for xpath in password_input_xpaths:
+                try:
+                    logger.info(f"[STEP] Trying to find password input with XPath: {xpath}")
+                    password_input = wait_for_visible_and_interactable(driver, xpath, timeout=8)
+                    if password_input:
+                        logger.info(f"[STEP] Found password input using xpath: {xpath}")
+                        break
+                except Exception as e:
+                    logger.warning(f"[STEP] Failed to find password with {xpath}: {e}")
+                    continue
+        
+        # If not found in main document, check iframes
+        if not password_input:
                 logger.info("[STEP] Password field not found in main document, checking iframes...")
                 iframes = driver.find_elements(By.TAG_NAME, "iframe")
                 for iframe in iframes:
@@ -1003,86 +1006,288 @@ def login_google(driver, email, password, known_totp_secret=None):
                         driver.switch_to.default_content()
                         continue
             
-            if not password_input:
-                # Last resort: try JavaScript to find and interact with password field
-                logger.info("[STEP] Trying JavaScript method to find password field...")
-                try:
-                    password_input = driver.execute_script("""
-                        var inputs = document.querySelectorAll('input[type="password"], input[name="Passwd"], input[name="password"]');
-                        for (var i = 0; i < inputs.length; i++) {
-                            var input = inputs[i];
-                            if (input.offsetParent !== null) { // Check if visible
-                                input.scrollIntoView({behavior: 'smooth', block: 'center'});
-                                input.focus();
-                                return input;
-                            }
+        if not password_input:
+            # Last resort: try JavaScript to find and interact with password field
+            logger.info("[STEP] Trying JavaScript method to find password field...")
+            try:
+                password_input = driver.execute_script("""
+                    var inputs = document.querySelectorAll('input[type="password"], input[name="Passwd"], input[name="password"]');
+                    for (var i = 0; i < inputs.length; i++) {
+                        var input = inputs[i];
+                        if (input.offsetParent !== null) { // Check if visible
+                            input.scrollIntoView({behavior: 'smooth', block: 'center'});
+                            input.focus();
+                            return input;
                         }
-                        return null;
-                    """)
-                    if password_input:
-                        logger.info("[STEP] Found password input using JavaScript")
-                except Exception as js_err:
-                    logger.error(f"[STEP] JavaScript method failed: {js_err}")
-            
-            if not password_input:
-                return False, "LOGIN_PASSWORD_FIELD_NOT_FOUND", "Password field not found after email submission (checked main document and iframes)"
-            
-            # Clear and enter password with multiple fallback methods
-            try:
-                # Method 1: Focus and clear using JavaScript first (more reliable)
-                driver.execute_script("arguments[0].focus();", password_input)
-                time.sleep(0.1)
-                driver.execute_script("arguments[0].click();", password_input)
-                time.sleep(0.1)
+                    }
+                    return null;
+                """)
+                if password_input:
+                    logger.info("[STEP] Found password input using JavaScript")
+            except Exception as js_err:
+                logger.error(f"[STEP] JavaScript method failed: {js_err}")
+        
+        if not password_input:
+                # DEBUG: Capture what's actually on the page when password field is not found
+                logger.error("=" * 80)
+                logger.error("[DEBUG] Password field not found - capturing page state for diagnosis")
+                logger.error("=" * 80)
                 
-                # Try standard clear first
+                # Save screenshot and page source to S3 for investigation
+                screenshot_saved = False
+                page_source_saved = False
                 try:
-                    password_input.clear()
-                except:
-                    # If clear fails, use JavaScript
-                    driver.execute_script("arguments[0].value = '';", password_input)
-                
-                time.sleep(0.2)  # Reduced wait time
-                
-                # Enter password using standard method
-                password_input.send_keys(password)
-                logger.info("[STEP] Password entered using standard method")
-            except Exception as e1:
-                logger.warning(f"[STEP] Standard method failed: {e1}, trying JavaScript...")
-                try:
-                    # Method 2: JavaScript interaction (more reliable fallback)
-                    driver.execute_script("arguments[0].focus();", password_input)
-                    driver.execute_script("arguments[0].click();", password_input)
-                    driver.execute_script("arguments[0].value = '';", password_input)
-                    driver.execute_script("arguments[0].value = arguments[1];", password_input, password)
-                    driver.execute_script("arguments[0].dispatchEvent(new Event('input', { bubbles: true }));", password_input)
-                    driver.execute_script("arguments[0].dispatchEvent(new Event('change', { bubbles: true }));", password_input)
-                    logger.info("[STEP] Password entered using JavaScript method")
-                except Exception as e2:
-                    logger.error(f"[STEP] JavaScript method also failed: {e2}")
-                    return False, "LOGIN_PASSWORD_INPUT_FAILED", f"Could not enter password: {e2}"
-            
-            # Verify password was entered
-            try:
-                entered_password = password_input.get_attribute('value')
-                if not entered_password or entered_password != password:
-                    logger.warning(f"[STEP] Password verification failed. Expected length: {len(password)}, Got: {len(entered_password) if entered_password else 0}")
-                    # Try one more time with JavaScript
+                    s3_bucket = os.environ.get("S3_DEBUG_BUCKET", "gbot-debug-screenshots")
+                    timestamp = int(time.time())
+                    email_safe = email.replace("@", "_at_").replace(".", "_")
+                    screenshot_key = f"password-field-not-found/{email_safe}_{timestamp}_screenshot.png"
+                    page_source_key = f"password-field-not-found/{email_safe}_{timestamp}_page_source.html"
+                    
+                    # Take screenshot
                     try:
-                        driver.execute_script("arguments[0].value = arguments[1];", password_input, password)
-                        entered_password = password_input.get_attribute('value')
-                        if entered_password != password:
-                            logger.error("[STEP] Password still not entered correctly after retry")
+                        screenshot_path = f"/tmp/password_not_found_{timestamp}.png"
+                        driver.save_screenshot(screenshot_path)
+                        
+                        # Upload to S3
+                        s3_client = get_s3_client()
+                        s3_client.upload_file(
+                            screenshot_path,
+                            s3_bucket,
+                            screenshot_key,
+                            ExtraArgs={'ContentType': 'image/png'}
+                        )
+                        screenshot_saved = True
+                        logger.error(f"[DEBUG] ✓ Screenshot saved to S3: s3://{s3_bucket}/{screenshot_key}")
+                        
+                        # Clean up local file
+                        try:
+                            os.remove(screenshot_path)
+                        except:
+                            pass
+                    except Exception as screenshot_err:
+                        logger.error(f"[DEBUG] ✗ Failed to save screenshot: {screenshot_err}")
+                    
+                    # Save page source (HTML)
+                    try:
+                        page_source = driver.page_source
+                        page_source_path = f"/tmp/password_not_found_{timestamp}.html"
+                        with open(page_source_path, 'w', encoding='utf-8') as f:
+                            f.write(page_source)
+                        
+                        # Upload to S3
+                        s3_client = get_s3_client()
+                        s3_client.upload_file(
+                            page_source_path,
+                            s3_bucket,
+                            page_source_key,
+                            ExtraArgs={'ContentType': 'text/html'}
+                        )
+                        page_source_saved = True
+                        logger.error(f"[DEBUG] ✓ Page source saved to S3: s3://{s3_bucket}/{page_source_key}")
+                        
+                        # Clean up local file
+                        try:
+                            os.remove(page_source_path)
+                        except:
+                            pass
+                    except Exception as page_source_err:
+                        logger.error(f"[DEBUG] ✗ Failed to save page source: {page_source_err}")
+                    
+                    if screenshot_saved or page_source_saved:
+                        logger.error(f"[DEBUG] Investigation files saved to S3 bucket: {s3_bucket}")
+                        logger.error(f"[DEBUG] Check S3 for: {screenshot_key} and {page_source_key}")
+                    
+                except Exception as s3_err:
+                    logger.error(f"[DEBUG] ✗ Error saving to S3: {s3_err}")
+                    logger.error(traceback.format_exc())
+                
+                try:
+                    # 1. Current URL
+                    current_url = driver.current_url
+                    logger.error(f"[DEBUG] Current URL: {current_url}")
+                    
+                    # 2. Page title
+                    page_title = driver.title
+                    logger.error(f"[DEBUG] Page title: {page_title}")
+                    
+                    # 3. All visible text on the page (first 2000 chars)
+                    try:
+                        page_text = driver.find_element(By.TAG_NAME, "body").text
+                        logger.error(f"[DEBUG] Visible page text (first 2000 chars): {page_text[:2000]}")
                     except:
-                        pass
-            except Exception as verify_err:
-                logger.warning(f"[STEP] Could not verify password entry: {verify_err}")
+                        logger.error("[DEBUG] Could not extract page text")
+                    
+                    # 4. All input elements and their attributes
+                    try:
+                        all_inputs = driver.find_elements(By.TAG_NAME, "input")
+                        logger.error(f"[DEBUG] Found {len(all_inputs)} input element(s) on page:")
+                        for i, inp in enumerate(all_inputs[:20]):  # Limit to first 20
+                            try:
+                                inp_type = inp.get_attribute('type') or 'N/A'
+                                inp_name = inp.get_attribute('name') or 'N/A'
+                                inp_id = inp.get_attribute('id') or 'N/A'
+                                inp_placeholder = inp.get_attribute('placeholder') or 'N/A'
+                                inp_aria_label = inp.get_attribute('aria-label') or 'N/A'
+                                is_displayed = inp.is_displayed()
+                                is_enabled = inp.is_enabled()
+                                logger.error(f"[DEBUG]   Input {i+1}: type={inp_type}, name={inp_name}, id={inp_id}, placeholder={inp_placeholder}, aria-label={inp_aria_label}, displayed={is_displayed}, enabled={is_enabled}")
+                            except Exception as inp_err:
+                                logger.error(f"[DEBUG]   Input {i+1}: Error reading attributes: {inp_err}")
+                    except Exception as inputs_err:
+                        logger.error(f"[DEBUG] Could not list input elements: {inputs_err}")
+                    
+                    # 5. Check for error messages or alerts
+                    try:
+                        error_selectors = [
+                            "//*[contains(text(), 'error') or contains(text(), 'Error')]",
+                            "//*[contains(text(), 'wrong') or contains(text(), 'Wrong')]",
+                            "//*[contains(text(), 'invalid') or contains(text(), 'Invalid')]",
+                            "//*[contains(text(), 'try again') or contains(text(), 'Try again')]",
+                            "//*[@role='alert']",
+                            "//*[contains(@class, 'error')]",
+                        ]
+                        for selector in error_selectors:
+                            try:
+                                error_elements = driver.find_elements(By.XPATH, selector)
+                                if error_elements:
+                                    for err_elem in error_elements[:5]:  # First 5 error elements
+                                        try:
+                                            err_text = err_elem.text.strip()
+                                            if err_text:
+                                                logger.error(f"[DEBUG] Error message found: {err_text}")
+                                        except:
+                                            pass
+                            except:
+                                pass
+                    except Exception as err_check_err:
+                        logger.error(f"[DEBUG] Could not check for error messages: {err_check_err}")
+                    
+                    # 6. Check for CAPTCHA elements
+                    try:
+                        captcha_indicators = [
+                            "//iframe[contains(@src, 'recaptcha')]",
+                            "//div[contains(@class, 'recaptcha')]",
+                            "//*[contains(text(), 'unusual traffic')]",
+                            "//*[contains(text(), 'verify you')]",
+                        ]
+                        for indicator in captcha_indicators:
+                            try:
+                                captcha_elements = driver.find_elements(By.XPATH, indicator)
+                                if captcha_elements:
+                                    logger.error(f"[DEBUG] CAPTCHA indicator found: {indicator}")
+                            except:
+                                pass
+                    except Exception as captcha_check_err:
+                        logger.error(f"[DEBUG] Could not check for CAPTCHA: {captcha_check_err}")
+                    
+                    # 7. Get page source snippet (first 5000 chars)
+                    try:
+                        page_source = driver.page_source
+                        logger.error(f"[DEBUG] Page source snippet (first 5000 chars): {page_source[:5000]}")
+                    except Exception as source_err:
+                        logger.error(f"[DEBUG] Could not get page source: {source_err}")
+                    
+                    # 8. List all iframes
+                    try:
+                        iframes = driver.find_elements(By.TAG_NAME, "iframe")
+                        logger.error(f"[DEBUG] Found {len(iframes)} iframe(s) on page")
+                        for i, iframe in enumerate(iframes[:10]):  # First 10 iframes
+                            try:
+                                iframe_src = iframe.get_attribute('src') or 'N/A'
+                                iframe_id = iframe.get_attribute('id') or 'N/A'
+                                logger.error(f"[DEBUG]   Iframe {i+1}: src={iframe_src[:100]}, id={iframe_id}")
+                            except:
+                                pass
+                    except Exception as iframe_err:
+                        logger.error(f"[DEBUG] Could not list iframes: {iframe_err}")
+                    
+                    # 9. Check for any password-related elements (even if not visible)
+                    try:
+                        password_elements = driver.find_elements(By.XPATH, "//*[contains(@name, 'pass') or contains(@id, 'pass') or contains(@type, 'password') or contains(@aria-label, 'pass')]")
+                        logger.error(f"[DEBUG] Found {len(password_elements)} password-related element(s):")
+                        for i, pwd_elem in enumerate(password_elements[:10]):
+                            try:
+                                pwd_tag = pwd_elem.tag_name
+                                pwd_type = pwd_elem.get_attribute('type') or 'N/A'
+                                pwd_name = pwd_elem.get_attribute('name') or 'N/A'
+                                pwd_id = pwd_elem.get_attribute('id') or 'N/A'
+                                pwd_displayed = pwd_elem.is_displayed()
+                                logger.error(f"[DEBUG]   Password element {i+1}: tag={pwd_tag}, type={pwd_type}, name={pwd_name}, id={pwd_id}, displayed={pwd_displayed}")
+                            except:
+                                pass
+                    except Exception as pwd_elem_err:
+                        logger.error(f"[DEBUG] Could not check password elements: {pwd_elem_err}")
+                    
+                    logger.error("=" * 80)
+                    logger.error("[DEBUG] End of page state capture")
+                    logger.error("=" * 80)
+                except Exception as debug_err:
+                    logger.error(f"[DEBUG] Error during page state capture: {debug_err}")
+                    logger.error(traceback.format_exc())
+                
+                error_msg = "Password field not found after email submission (checked main document and iframes)."
+                if screenshot_saved or page_source_saved:
+                    error_msg += f" Screenshot and page source saved to S3 for investigation."
+                else:
+                    error_msg += " See DEBUG logs above for page state."
+                return False, "LOGIN_PASSWORD_FIELD_NOT_FOUND", error_msg
+        
+        # Clear and enter password with multiple fallback methods
+        try:
+            # Add human-like behavior before password entry
+            random_scroll_and_mouse_move(driver)
+            add_random_delays()
             
-            logger.info("[STEP] Password entered successfully")
-        except Exception as password_err:
-            logger.error(f"[STEP] Login exception: {password_err}")
-            logger.error(traceback.format_exc())
-            return False, "LOGIN_PASSWORD_EXCEPTION", f"Exception during password entry: {str(password_err)}"
+            # Method 1: Focus and clear using JavaScript first (more reliable)
+            driver.execute_script("arguments[0].focus();", password_input)
+            time.sleep(random.uniform(0.1, 0.2))
+            driver.execute_script("arguments[0].click();", password_input)
+            time.sleep(random.uniform(0.1, 0.2))
+            
+            # Try standard clear first
+            try:
+                password_input.clear()
+            except:
+                # If clear fails, use JavaScript
+                driver.execute_script("arguments[0].value = '';", password_input)
+            
+            time.sleep(random.uniform(0.2, 0.4))  # Random wait time
+            
+            # Enter password using human-like typing simulation
+            simulate_human_typing(password_input, password, driver)
+            logger.info("[STEP] Password entered using human-like typing simulation")
+        except Exception as e1:
+            logger.warning(f"[STEP] Standard method failed: {e1}, trying JavaScript...")
+            try:
+                # Method 2: JavaScript interaction (more reliable fallback)
+                driver.execute_script("arguments[0].focus();", password_input)
+                driver.execute_script("arguments[0].click();", password_input)
+                driver.execute_script("arguments[0].value = '';", password_input)
+                driver.execute_script("arguments[0].value = arguments[1];", password_input, password)
+                driver.execute_script("arguments[0].dispatchEvent(new Event('input', { bubbles: true }));", password_input)
+                driver.execute_script("arguments[0].dispatchEvent(new Event('change', { bubbles: true }));", password_input)
+                logger.info("[STEP] Password entered using JavaScript method")
+            except Exception as e2:
+                logger.error(f"[STEP] JavaScript method also failed: {e2}")
+                return False, "LOGIN_PASSWORD_INPUT_FAILED", f"Could not enter password: {e2}"
+        
+        # Verify password was entered
+        try:
+            entered_password = password_input.get_attribute('value')
+            if not entered_password or entered_password != password:
+                logger.warning(f"[STEP] Password verification failed. Expected length: {len(password)}, Got: {len(entered_password) if entered_password else 0}")
+                # Try one more time with JavaScript
+                try:
+                    driver.execute_script("arguments[0].value = arguments[1];", password_input, password)
+                    entered_password = password_input.get_attribute('value')
+                    if entered_password != password:
+                        logger.error("[STEP] Password still not entered correctly after retry")
+                except:
+                    pass
+        except Exception as verify_err:
+            logger.warning(f"[STEP] Could not verify password entry: {verify_err}")
+        
+        logger.info("[STEP] Password entered successfully")
         time.sleep(1)
         
         # Click Next button
@@ -2336,17 +2541,17 @@ def handler(event, context):
         # Single user mode (backward compatible)
         email = event.get("email", os.environ.get("GW_EMAIL"))
         password = event.get("password", os.environ.get("GW_PASSWORD"))
-        
-        if not email or not password:
-            return {
-                "status": "failed",
-                "step_completed": "init",
-                "error_step": "init",
-                "error_message": "Email or password not provided in event or environment",
-                "app_password": None,
-                "secret_key": None,
-                "timings": timings
-            }
+    
+    if not email or not password:
+        return {
+            "status": "failed",
+            "step_completed": "init",
+            "error_step": "init",
+            "error_message": "Email or password not provided in event or environment",
+            "app_password": None,
+            "secret_key": None,
+            "timings": timings
+        }
         
         logger.info(f"[LAMBDA] Single user mode: {email}")
         return process_single_user(email, password, start_time)
