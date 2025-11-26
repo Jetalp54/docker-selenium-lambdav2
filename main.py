@@ -70,6 +70,37 @@ def get_s3_client():
         _s3_client = boto3.client("s3")
     return _s3_client
 
+def ensure_s3_bucket_exists(bucket_name, region='us-east-1'):
+    """Create S3 bucket if it doesn't exist"""
+    try:
+        s3_client = get_s3_client()
+        s3_client.head_bucket(Bucket=bucket_name)
+        logger.debug(f"[S3] Bucket {bucket_name} already exists")
+        return True
+    except ClientError as e:
+        error_code = e.response.get('Error', {}).get('Code', '')
+        if error_code == '404' or error_code == 'NoSuchBucket':
+            try:
+                # Try to create bucket
+                if region == 'us-east-1':
+                    s3_client.create_bucket(Bucket=bucket_name)
+                else:
+                    s3_client.create_bucket(
+                        Bucket=bucket_name,
+                        CreateBucketConfiguration={'LocationConstraint': region}
+                    )
+                logger.info(f"[S3] Created bucket {bucket_name} in region {region}")
+                return True
+            except Exception as create_err:
+                logger.warning(f"[S3] Could not create bucket {bucket_name}: {create_err}")
+                return False
+        else:
+            logger.warning(f"[S3] Could not access bucket {bucket_name}: {e}")
+            return False
+    except Exception as e:
+        logger.warning(f"[S3] Error checking bucket {bucket_name}: {e}")
+        return False
+
 # =====================================================================
 # Chrome Driver Initialization for AWS Lambda (with anti-detection)
 # =====================================================================
@@ -932,19 +963,54 @@ def login_google(driver, email, password, known_totp_secret=None):
             email_input.send_keys(Keys.RETURN)
         logger.info("[STEP] Email submitted")
 
-        # Wait for password field - reduced wait time
-        time.sleep(2)  # Wait for page to transition after email submission
+        # Wait for page to transition after email submission
+        time.sleep(3)  # Increased wait to allow page transition
         
         # Add human-like behavior after email submission
         add_random_delays()
         random_scroll_and_mouse_move(driver)
         
+        # Check if we're still on the identifier page (email submission failed or CAPTCHA appeared)
+        current_url = driver.current_url
+        page_title = driver.title
+        logger.info(f"[STEP] After email submission - URL: {current_url[:100]}..., Title: {page_title}")
+        
         # Check for CAPTCHA after email submission (this is when it typically appears)
         if detect_captcha(driver):
             logger.warning("[STEP] ⚠️ CAPTCHA detected after email submission!")
+            # Check for CAPTCHA text in page
+            try:
+                page_text = driver.find_element(By.TAG_NAME, "body").text.lower()
+                if any(indicator in page_text for indicator in ['type the text you hear or see', 'verify you\'re not a robot', 'unusual traffic']):
+                    logger.error("[STEP] ✗✗✗ CAPTCHA BLOCKING LOGIN - Page text confirms CAPTCHA presence")
+                    return False, "CAPTCHA_DETECTED", "CAPTCHA detected after email submission. Manual intervention required."
+            except:
+                pass
             return False, "CAPTCHA_DETECTED", "CAPTCHA detected after email submission. Manual intervention required."
         
-        time.sleep(1)  # Additional wait for password field to appear
+        # Check if we're still on identifier page (email might not have been submitted or page redirected back)
+        if '/signin/identifier' in current_url or 'identifier' in current_url.lower():
+            logger.warning("[STEP] ⚠️ Still on identifier page after email submission - checking for issues...")
+            # Check for error messages
+            try:
+                error_elements = driver.find_elements(By.XPATH, "//*[contains(text(), 'Couldn\\'t find your Google Account') or contains(text(), 'Enter a valid email') or contains(text(), 'error')]")
+                if error_elements:
+                    error_text = error_elements[0].text
+                    logger.error(f"[STEP] ✗ Error on identifier page: {error_text}")
+                    return False, "EMAIL_ERROR", f"Error after email submission: {error_text}"
+            except:
+                pass
+            
+            # Check if CAPTCHA is present (might not be detected by detect_captcha)
+            try:
+                captcha_elements = driver.find_elements(By.XPATH, "//*[contains(text(), 'Type the text you hear or see') or contains(@class, 'captcha') or contains(@id, 'captcha')]")
+                if captcha_elements:
+                    logger.error("[STEP] ✗✗✗ CAPTCHA FOUND ON IDENTIFIER PAGE - Blocking email submission")
+                    return False, "CAPTCHA_DETECTED", "CAPTCHA detected on identifier page. Manual intervention required."
+            except:
+                pass
+        
+        time.sleep(2)  # Additional wait for password field to appear
         
         # Check for iframes first (Google sometimes uses iframes for password field)
         password_input = None
@@ -965,8 +1031,6 @@ def login_google(driver, email, password, known_totp_secret=None):
                 "/html/body/div[2]/div[1]/div[1]/div[2]/c-wiz/main/div[2]/div/div/div/form/span/section[2]/div/div/div[1]/div[1]/div/div/div/div/div[1]/div/div[1]/input",  # User-provided working XPath
                 "//input[@id='password']",
                 "//input[@name='password']",
-                "//input[@aria-label*='password']",
-                "//input[@aria-label*='Password']",
                 "//input[contains(@aria-label, 'password')]",
                 "//input[contains(@aria-label, 'Password')]",
             ]
@@ -1033,11 +1097,53 @@ def login_google(driver, email, password, known_totp_secret=None):
                 logger.error("[DEBUG] Password field not found - capturing page state for diagnosis")
                 logger.error("=" * 80)
                 
-                # Save screenshot and page source to S3 for investigation
+                # ALWAYS log page source to CloudWatch (even if S3 fails)
+                try:
+                    page_source = driver.page_source
+                    current_url = driver.current_url
+                    page_title = driver.title
+                    
+                    # Log critical information to CloudWatch
+                    logger.error(f"[DEBUG] Current URL: {current_url}")
+                    logger.error(f"[DEBUG] Page title: {page_title}")
+                    
+                    # Check for CAPTCHA indicators in page source
+                    captcha_indicators = [
+                        'recaptcha', 'g-recaptcha', 'captcha', 'challenge', 
+                        'unusual traffic', 'automated queries', 'verify you\'re not a robot'
+                    ]
+                    found_indicators = []
+                    page_source_lower = page_source.lower()
+                    for indicator in captcha_indicators:
+                        if indicator in page_source_lower:
+                            found_indicators.append(indicator)
+                    
+                    if found_indicators:
+                        logger.error(f"[DEBUG] ⚠️ CAPTCHA/BLOCKER DETECTED! Found indicators: {found_indicators}")
+                    
+                    # Log first 5000 chars of page source to CloudWatch
+                    logger.error(f"[DEBUG] Page source (first 5000 chars): {page_source[:5000]}")
+                    
+                    # Try to extract visible text
+                    try:
+                        page_text = driver.find_element(By.TAG_NAME, "body").text
+                        logger.error(f"[DEBUG] Visible page text (first 2000 chars): {page_text[:2000]}")
+                    except:
+                        logger.error("[DEBUG] Could not extract page text")
+                    
+                except Exception as log_err:
+                    logger.error(f"[DEBUG] Failed to log page state: {log_err}")
+                
+                # Save screenshot and page source to S3 for investigation (optional)
                 screenshot_saved = False
                 page_source_saved = False
                 try:
                     s3_bucket = os.environ.get("S3_DEBUG_BUCKET", "gbot-debug-screenshots")
+                    
+                    # Ensure bucket exists
+                    s3_region = os.environ.get("AWS_REGION", "us-east-1")
+                    ensure_s3_bucket_exists(s3_bucket, s3_region)
+                    
                     timestamp = int(time.time())
                     email_safe = email.replace("@", "_at_").replace(".", "_")
                     screenshot_key = f"password-field-not-found/{email_safe}_{timestamp}_screenshot.png"
@@ -1067,9 +1173,10 @@ def login_google(driver, email, password, known_totp_secret=None):
                     except Exception as screenshot_err:
                         logger.error(f"[DEBUG] ✗ Failed to save screenshot: {screenshot_err}")
                     
-                    # Save page source (HTML)
+                    # Save page source (HTML) to S3
                     try:
-                        page_source = driver.page_source
+                        if 'page_source' not in locals():
+                            page_source = driver.page_source
                         page_source_path = f"/tmp/password_not_found_{timestamp}.html"
                         with open(page_source_path, 'w', encoding='utf-8') as f:
                             f.write(page_source)
@@ -1091,33 +1198,18 @@ def login_google(driver, email, password, known_totp_secret=None):
                         except:
                             pass
                     except Exception as page_source_err:
-                        logger.error(f"[DEBUG] ✗ Failed to save page source: {page_source_err}")
+                        logger.error(f"[DEBUG] ✗ Failed to save page source to S3: {page_source_err}")
                     
                     if screenshot_saved or page_source_saved:
                         logger.error(f"[DEBUG] Investigation files saved to S3 bucket: {s3_bucket}")
                         logger.error(f"[DEBUG] Check S3 for: {screenshot_key} and {page_source_key}")
                     
                 except Exception as s3_err:
-                    logger.error(f"[DEBUG] ✗ Error saving to S3: {s3_err}")
-                    logger.error(traceback.format_exc())
+                    logger.error(f"[DEBUG] ✗ Error with S3 operations: {s3_err}")
+                    logger.error(f"[DEBUG] Note: Page source and debug info are logged above in CloudWatch")
                 
+                # Additional detailed debugging: All input elements and their attributes
                 try:
-                    # 1. Current URL
-                    current_url = driver.current_url
-                    logger.error(f"[DEBUG] Current URL: {current_url}")
-                    
-                    # 2. Page title
-                    page_title = driver.title
-                    logger.error(f"[DEBUG] Page title: {page_title}")
-                    
-                    # 3. All visible text on the page (first 2000 chars)
-                    try:
-                        page_text = driver.find_element(By.TAG_NAME, "body").text
-                        logger.error(f"[DEBUG] Visible page text (first 2000 chars): {page_text[:2000]}")
-                    except:
-                        logger.error("[DEBUG] Could not extract page text")
-                    
-                    # 4. All input elements and their attributes
                     try:
                         all_inputs = driver.find_elements(By.TAG_NAME, "input")
                         logger.error(f"[DEBUG] Found {len(all_inputs)} input element(s) on page:")
