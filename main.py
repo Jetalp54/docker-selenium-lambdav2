@@ -20,7 +20,10 @@ import string
 import logging
 import traceback
 import subprocess
+import urllib.parse
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 
 # 3rd-party libraries
 import boto3
@@ -105,10 +108,90 @@ def ensure_s3_bucket_exists(bucket_name, region='us-east-1'):
 # Chrome Driver Initialization for AWS Lambda (with anti-detection)
 # =====================================================================
 
+# Global proxy list and rotation counter (for batch processing)
+import threading
+_proxy_list_cache = None
+_proxy_rotation_counter = 0
+_proxy_lock = threading.Lock()
+
+def get_proxy_list_from_env():
+    """Get and parse proxy list from environment variable"""
+    global _proxy_list_cache
+    
+    if _proxy_list_cache is not None:
+        return _proxy_list_cache
+    
+    proxy_enabled = os.environ.get('PROXY_ENABLED', 'false').lower() == 'true'
+    if not proxy_enabled:
+        _proxy_list_cache = []
+        return []
+    
+    proxy_list_str = os.environ.get('PROXY_LIST', '').strip()
+    if not proxy_list_str:
+        _proxy_list_cache = []
+        return []
+    
+    proxies = []
+    for line in proxy_list_str.split('\n'):
+        line = line.strip()
+        if not line:
+            continue
+        
+        parts = line.split(':')
+        if len(parts) == 4:
+            ip, port, username, password = parts
+            proxies.append({
+                'ip': ip,
+                'port': port,
+                'username': username,
+                'password': password,
+                'full': line
+            })
+    
+    _proxy_list_cache = proxies
+    logger.info(f"[PROXY] Loaded {len(proxies)} proxy/proxies from environment")
+    return proxies
+
+def get_rotated_proxy_for_user():
+    """Get next proxy from list using round-robin rotation (thread-safe)"""
+    proxies = get_proxy_list_from_env()
+    if not proxies:
+        return None
+    
+    global _proxy_rotation_counter
+    with _proxy_lock:
+        proxy = proxies[_proxy_rotation_counter % len(proxies)]
+        _proxy_rotation_counter += 1
+        return proxy
+
+def get_proxy_from_env():
+    """
+    Get proxy configuration for current user (with rotation).
+    Format: IP:PORT:USERNAME:PASSWORD
+    Returns: dict with proxy config or None if not set
+    """
+    proxy = get_rotated_proxy_for_user()
+    if not proxy:
+        return None
+    
+    try:
+        return {
+            'ip': proxy['ip'],
+            'port': proxy['port'],
+            'username': proxy['username'],
+            'password': proxy['password'],
+            'http': f'http://{proxy["username"]}:{proxy["password"]}@{proxy["ip"]}:{proxy["port"]}',
+            'https': f'http://{proxy["username"]}:{proxy["password"]}@{proxy["ip"]}:{proxy["port"]}'  # Use http for SOCKS proxies
+        }
+    except Exception as e:
+        logger.warning(f"[PROXY] Error formatting proxy config: {e}")
+        return None
+
 def get_chrome_driver():
     """
     Initialize Selenium Chrome driver for AWS Lambda environment.
     Uses standard Selenium with CDP-based anti-detection (Lambda-compatible).
+    Supports proxy configuration if PROXY_CONFIG environment variable is set.
     """
     # Force environment variables to prevent SeleniumManager from trying to write to read-only FS
     os.environ['HOME'] = '/tmp'
@@ -190,6 +273,12 @@ def get_chrome_driver():
 
     # Use Selenium Chrome options with anti-detection
     chrome_options = Options()
+    
+    # Get proxy configuration if enabled
+    proxy_config = get_proxy_from_env()
+    if proxy_config:
+        logger.info(f"[PROXY] Using proxy: {proxy_config['ip']}:{proxy_config['port']}")
+        chrome_options.add_argument(f"--proxy-server={proxy_config['http']}")
     
     # Core stability options for Lambda
     chrome_options.add_argument("--headless=new")
@@ -510,6 +599,279 @@ def wait_for_password_clickable(driver, by_method, selector, timeout=10):
     except Exception as e:
         logger.warning(f"[SELENIUM] Error waiting for password field: {e}")
         return None
+
+def get_twocaptcha_config():
+    """Get 2Captcha configuration from environment variables"""
+    api_key = os.environ.get('TWOCAPTCHA_API_KEY', '').strip()
+    enabled = os.environ.get('TWOCAPTCHA_ENABLED', 'false').lower() == 'true'
+    
+    if enabled and api_key:
+        return {'enabled': True, 'api_key': api_key}
+    return {'enabled': False, 'api_key': None}
+
+def solve_recaptcha_v2(driver, api_key, site_key=None, page_url=None):
+    """
+    Solve reCAPTCHA v2 using 2Captcha API.
+    
+    Args:
+        driver: Selenium WebDriver instance
+        api_key: 2Captcha API key
+        site_key: reCAPTCHA site key (optional, will be extracted from page if not provided)
+        page_url: Current page URL (optional, will use driver.current_url if not provided)
+    
+    Returns:
+        (success: bool, token: str|None, error: str|None)
+    """
+    try:
+        logger.info("[2CAPTCHA] Starting reCAPTCHA v2 solving...")
+        
+        # Get page URL if not provided
+        if not page_url:
+            page_url = driver.current_url
+        
+        # Extract site key from page if not provided
+        if not site_key:
+            logger.info("[2CAPTCHA] Extracting reCAPTCHA site key from page...")
+            try:
+                # Try to find site key in page source
+                page_source = driver.page_source
+                
+                # Pattern 1: data-sitekey attribute
+                site_key_match = re.search(r'data-sitekey=["\']([^"\']+)["\']', page_source)
+                if site_key_match:
+                    site_key = site_key_match.group(1)
+                    logger.info(f"[2CAPTCHA] Found site key in data-sitekey: {site_key[:20]}...")
+                else:
+                    # Pattern 2: recaptcha/api.js?render= or k= parameter
+                    site_key_match = re.search(r'(?:recaptcha/api\.js\?render=|k=)([a-zA-Z0-9_-]+)', page_source)
+                    if site_key_match:
+                        site_key = site_key_match.group(1)
+                        logger.info(f"[2CAPTCHA] Found site key in API URL: {site_key[:20]}...")
+                    else:
+                        # Pattern 3: Check iframe src
+                        try:
+                            iframes = driver.find_elements(By.XPATH, "//iframe[contains(@src, 'recaptcha')]")
+                            for iframe in iframes:
+                                iframe_src = iframe.get_attribute('src')
+                                if iframe_src:
+                                    site_key_match = re.search(r'k=([a-zA-Z0-9_-]+)', iframe_src)
+                                    if site_key_match:
+                                        site_key = site_key_match.group(1)
+                                        logger.info(f"[2CAPTCHA] Found site key in iframe src: {site_key[:20]}...")
+                                        break
+                        except:
+                            pass
+                
+                if not site_key:
+                    logger.error("[2CAPTCHA] Could not extract reCAPTCHA site key from page")
+                    return False, None, "Could not extract reCAPTCHA site key"
+            except Exception as e:
+                logger.error(f"[2CAPTCHA] Error extracting site key: {e}")
+                return False, None, f"Error extracting site key: {e}"
+        
+        logger.info(f"[2CAPTCHA] Site key: {site_key[:20]}..., Page URL: {page_url[:80]}...")
+        
+        # Step 1: Submit CAPTCHA to 2Captcha
+        logger.info("[2CAPTCHA] Submitting CAPTCHA to 2Captcha API...")
+        submit_url = 'http://2captcha.com/in.php'
+        submit_params = {
+            'key': api_key,
+            'method': 'userrecaptcha',
+            'googlekey': site_key,
+            'pageurl': page_url,
+            'json': 1
+        }
+        
+        submit_data = urllib.parse.urlencode(submit_params).encode('utf-8')
+        submit_request = urllib.request.Request(submit_url, data=submit_data)
+        
+        try:
+            with urllib.request.urlopen(submit_request, timeout=30) as response:
+                submit_result = json.loads(response.read().decode('utf-8'))
+                
+                if submit_result.get('status') != 1:
+                    error_msg = submit_result.get('request', 'Unknown error')
+                    logger.error(f"[2CAPTCHA] Failed to submit CAPTCHA: {error_msg}")
+                    return False, None, f"2Captcha submission failed: {error_msg}"
+                
+                task_id = submit_result.get('request')
+                logger.info(f"[2CAPTCHA] CAPTCHA submitted successfully. Task ID: {task_id}")
+        except Exception as e:
+            logger.error(f"[2CAPTCHA] Error submitting CAPTCHA: {e}")
+            return False, None, f"Error submitting CAPTCHA: {e}"
+        
+        # Step 2: Poll for solution (max 2 minutes, check every 5 seconds)
+        logger.info("[2CAPTCHA] Waiting for 2Captcha to solve CAPTCHA (this may take 10-120 seconds)...")
+        get_url = 'http://2captcha.com/res.php'
+        max_wait = 120  # 2 minutes
+        poll_interval = 5  # Check every 5 seconds
+        waited = 0
+        
+        while waited < max_wait:
+            time.sleep(poll_interval)
+            waited += poll_interval
+            
+            get_params = {
+                'key': api_key,
+                'action': 'get',
+                'id': task_id,
+                'json': 1
+            }
+            
+            get_url_with_params = f"{get_url}?{urllib.parse.urlencode(get_params)}"
+            get_request = urllib.request.Request(get_url_with_params)
+            
+            try:
+                with urllib.request.urlopen(get_request, timeout=10) as response:
+                    get_result = json.loads(response.read().decode('utf-8'))
+                    
+                    if get_result.get('status') == 1:
+                        token = get_result.get('request')
+                        logger.info(f"[2CAPTCHA] ✓✓✓ CAPTCHA solved successfully! Token received (waited {waited}s)")
+                        return True, token, None
+                    elif get_result.get('request') == 'CAPCHA_NOT_READY':
+                        if waited % 15 == 0:  # Log every 15 seconds
+                            logger.info(f"[2CAPTCHA] Still solving... (waited {waited}s/{max_wait}s)")
+                    else:
+                        error_msg = get_result.get('request', 'Unknown error')
+                        logger.error(f"[2CAPTCHA] Error getting solution: {error_msg}")
+                        return False, None, f"2Captcha solution error: {error_msg}"
+            except Exception as e:
+                logger.warning(f"[2CAPTCHA] Error polling for solution: {e}")
+                # Continue polling - might be transient error
+        
+        logger.error(f"[2CAPTCHA] Timeout waiting for CAPTCHA solution (waited {waited}s)")
+        return False, None, "Timeout waiting for 2Captcha solution"
+        
+    except Exception as e:
+        logger.error(f"[2CAPTCHA] Exception solving CAPTCHA: {e}")
+        logger.error(traceback.format_exc())
+        return False, None, f"Exception: {e}"
+
+def inject_recaptcha_token(driver, token):
+    """
+    Inject the solved reCAPTCHA token into the page.
+    This executes the callback function that Google reCAPTCHA expects.
+    """
+    try:
+        logger.info("[2CAPTCHA] Injecting reCAPTCHA token into page...")
+        
+        # Method 1: Find and execute the callback function
+        callback_script = f"""
+        // Find the callback function name
+        var callbackName = null;
+        var scripts = document.getElementsByTagName('script');
+        for (var i = 0; i < scripts.length; i++) {{
+            var scriptText = scripts[i].innerHTML;
+            var match = scriptText.match(/grecaptcha\.execute\([^,]+,\s*{{[^}}]*callback:\s*['"]([^'"]+)['"]/);
+            if (match) {{
+                callbackName = match[1];
+                break;
+            }}
+        }}
+        
+        // If callback not found, try common patterns
+        if (!callbackName) {{
+            // Try window callbacks
+            for (var key in window) {{
+                if (key.startsWith('___grecaptcha_cfg') || key.includes('recaptcha')) {{
+                    var cfg = window[key];
+                    if (cfg && cfg.callback) {{
+                        callbackName = cfg.callback;
+                        break;
+                    }}
+                }}
+            }}
+        }}
+        
+        // Execute callback with token
+        if (callbackName && window[callbackName]) {{
+            window[callbackName]('{token}');
+            return 'callback_executed';
+        }} else {{
+            // Fallback: Set token in common locations
+            window.grecaptchaToken = '{token}';
+            
+            // Try to find and fill token input
+            var tokenInputs = document.querySelectorAll('input[name*="recaptcha"], textarea[name*="recaptcha"]');
+            for (var i = 0; i < tokenInputs.length; i++) {{
+                tokenInputs[i].value = '{token}';
+            }}
+            
+            // Trigger change events
+            var event = new Event('change', {{ bubbles: true }});
+            for (var i = 0; i < tokenInputs.length; i++) {{
+                tokenInputs[i].dispatchEvent(event);
+            }}
+            
+            return 'token_injected';
+        }}
+        """
+        
+        result = driver.execute_script(callback_script)
+        logger.info(f"[2CAPTCHA] Token injection result: {result}")
+        
+        # Wait a moment for the page to process the token
+        time.sleep(2)
+        
+        # Method 2: If callback method didn't work, try direct form submission
+        # Check if we need to submit a form with the token
+        try:
+            # Look for forms that might need the token
+            forms = driver.find_elements(By.TAG_NAME, "form")
+            for form in forms:
+                # Check if form has recaptcha-related inputs
+                recaptcha_inputs = form.find_elements(By.XPATH, ".//input[contains(@name, 'recaptcha')]")
+                if recaptcha_inputs:
+                    for inp in recaptcha_inputs:
+                        driver.execute_script("arguments[0].value = arguments[1];", inp, token)
+                        driver.execute_script("arguments[0].dispatchEvent(new Event('change', { bubbles: true }));", inp)
+                    logger.info("[2CAPTCHA] Token injected into form inputs")
+        except Exception as form_err:
+            logger.debug(f"[2CAPTCHA] Form injection attempt: {form_err}")
+        
+        return True
+    except Exception as e:
+        logger.error(f"[2CAPTCHA] Error injecting token: {e}")
+        logger.error(traceback.format_exc())
+        return False
+
+def solve_captcha_with_2captcha(driver):
+    """
+    Detect and solve CAPTCHA using 2Captcha API if enabled.
+    Returns (solved: bool, error: str|None)
+    """
+    try:
+        # Check if 2Captcha is enabled
+        twocaptcha_config = get_twocaptcha_config()
+        if not twocaptcha_config.get('enabled') or not twocaptcha_config.get('api_key'):
+            logger.info("[2CAPTCHA] 2Captcha is not enabled or API key not configured")
+            return False, "2Captcha not enabled"
+        
+        api_key = twocaptcha_config['api_key']
+        logger.info("[2CAPTCHA] 2Captcha is enabled, attempting to solve CAPTCHA...")
+        
+        # Solve the CAPTCHA
+        success, token, error = solve_recaptcha_v2(driver, api_key)
+        
+        if not success or not token:
+            logger.error(f"[2CAPTCHA] Failed to solve CAPTCHA: {error}")
+            return False, error or "Failed to solve CAPTCHA"
+        
+        # Inject the token into the page
+        inject_success = inject_recaptcha_token(driver, token)
+        
+        if not inject_success:
+            logger.warning("[2CAPTCHA] Token injection may have failed, but token was received")
+            # Continue anyway - sometimes the page processes it even if injection seems to fail
+        
+        logger.info("[2CAPTCHA] ✓✓✓ CAPTCHA solved and token injected successfully!")
+        return True, None
+        
+    except Exception as e:
+        logger.error(f"[2CAPTCHA] Exception in solve_captcha_with_2captcha: {e}")
+        logger.error(traceback.format_exc())
+        return False, str(e)
 
 def detect_captcha(driver):
     """Detect if Google CAPTCHA is present on the page - more accurate detection to avoid false positives"""
@@ -978,15 +1340,38 @@ def login_google(driver, email, password, known_totp_secret=None):
         # Check for CAPTCHA after email submission (this is when it typically appears)
         if detect_captcha(driver):
             logger.warning("[STEP] ⚠️ CAPTCHA detected after email submission!")
-            # Check for CAPTCHA text in page
-            try:
-                page_text = driver.find_element(By.TAG_NAME, "body").text.lower()
-                if any(indicator in page_text for indicator in ['type the text you hear or see', 'verify you\'re not a robot', 'unusual traffic']):
-                    logger.error("[STEP] ✗✗✗ CAPTCHA BLOCKING LOGIN - Page text confirms CAPTCHA presence")
-                    return False, "CAPTCHA_DETECTED", "CAPTCHA detected after email submission. Manual intervention required."
-            except:
-                pass
-            return False, "CAPTCHA_DETECTED", "CAPTCHA detected after email submission. Manual intervention required."
+            
+            # Try to solve CAPTCHA using 2Captcha if enabled
+            solved, solve_error = solve_captcha_with_2captcha(driver)
+            
+            if solved:
+                logger.info("[STEP] ✓✓✓ CAPTCHA solved using 2Captcha! Continuing with login...")
+                # Wait a moment for page to process the solved CAPTCHA
+                time.sleep(3)
+                
+                # Check if CAPTCHA is still present (should be gone if solved correctly)
+                if detect_captcha(driver):
+                    logger.warning("[STEP] ⚠️ CAPTCHA still present after solving attempt. Retrying...")
+                    # Try one more time
+                    time.sleep(2)
+                    solved_retry, _ = solve_captcha_with_2captcha(driver)
+                    if not solved_retry:
+                        logger.error("[STEP] ✗✗✗ CAPTCHA solving failed after retry")
+                        return False, "CAPTCHA_SOLVE_FAILED", "CAPTCHA detected and 2Captcha solving failed"
+                else:
+                    logger.info("[STEP] ✓ CAPTCHA cleared after solving! Proceeding...")
+            else:
+                # CAPTCHA solving failed or not enabled
+                logger.error(f"[STEP] ✗✗✗ CAPTCHA BLOCKING LOGIN - Solving failed: {solve_error}")
+                # Check for CAPTCHA text in page
+                try:
+                    page_text = driver.find_element(By.TAG_NAME, "body").text.lower()
+                    if any(indicator in page_text for indicator in ['type the text you hear or see', 'verify you\'re not a robot', 'unusual traffic']):
+                        logger.error("[STEP] ✗✗✗ CAPTCHA BLOCKING LOGIN - Page text confirms CAPTCHA presence")
+                        return False, "CAPTCHA_DETECTED", f"CAPTCHA detected after email submission. 2Captcha solving failed: {solve_error}"
+                except:
+                    pass
+                return False, "CAPTCHA_DETECTED", f"CAPTCHA detected after email submission. 2Captcha solving failed: {solve_error}"
         
         # Check if we're still on identifier page (email might not have been submitted or page redirected back)
         if '/signin/identifier' in current_url or 'identifier' in current_url.lower():
@@ -1005,8 +1390,32 @@ def login_google(driver, email, password, known_totp_secret=None):
             try:
                 captcha_elements = driver.find_elements(By.XPATH, "//*[contains(text(), 'Type the text you hear or see') or contains(@class, 'captcha') or contains(@id, 'captcha')]")
                 if captcha_elements:
-                    logger.error("[STEP] ✗✗✗ CAPTCHA FOUND ON IDENTIFIER PAGE - Blocking email submission")
-                    return False, "CAPTCHA_DETECTED", "CAPTCHA detected on identifier page. Manual intervention required."
+                    logger.warning("[STEP] ⚠️ CAPTCHA FOUND ON IDENTIFIER PAGE - Attempting to solve...")
+                    
+                    # Try to solve CAPTCHA using 2Captcha if enabled
+                    solved, solve_error = solve_captcha_with_2captcha(driver)
+                    
+                    if solved:
+                        logger.info("[STEP] ✓✓✓ CAPTCHA solved using 2Captcha! Retrying email submission...")
+                        time.sleep(3)
+                        # Retry email submission after solving
+                        try:
+                            email_input = wait_for_xpath(driver, "//input[@id='identifierId']", timeout=10)
+                            if email_input:
+                                email_input.clear()
+                                simulate_human_typing(email_input, email, driver)
+                                email_input.send_keys(Keys.RETURN)
+                                logger.info("[STEP] Email resubmitted after CAPTCHA solving")
+                                time.sleep(3)
+                            else:
+                                logger.error("[STEP] Could not find email input after CAPTCHA solving")
+                                return False, "CAPTCHA_SOLVE_FAILED", "CAPTCHA solved but could not resubmit email"
+                        except Exception as retry_err:
+                            logger.error(f"[STEP] Error resubmitting email after CAPTCHA solving: {retry_err}")
+                            return False, "CAPTCHA_SOLVE_FAILED", f"CAPTCHA solved but email resubmission failed: {retry_err}"
+                    else:
+                        logger.error(f"[STEP] ✗✗✗ CAPTCHA solving failed: {solve_error}")
+                        return False, "CAPTCHA_DETECTED", f"CAPTCHA detected on identifier page. 2Captcha solving failed: {solve_error}"
             except:
                 pass
         
@@ -1423,7 +1832,28 @@ def login_google(driver, email, password, known_totp_secret=None):
             # Check for CAPTCHA after password submission (this is another common place for CAPTCHA)
             if detect_captcha(driver):
                 logger.warning("[STEP] ⚠️ CAPTCHA detected after password submission!")
-                return False, "CAPTCHA_DETECTED", "CAPTCHA detected after password submission. Manual intervention required."
+                
+                # Try to solve CAPTCHA using 2Captcha if enabled
+                solved, solve_error = solve_captcha_with_2captcha(driver)
+                
+                if solved:
+                    logger.info("[STEP] ✓✓✓ CAPTCHA solved using 2Captcha! Continuing with login...")
+                    # Wait a moment for page to process the solved CAPTCHA
+                    time.sleep(3)
+                    
+                    # Check if CAPTCHA is still present
+                    if detect_captcha(driver):
+                        logger.warning("[STEP] ⚠️ CAPTCHA still present after solving. Retrying...")
+                        time.sleep(2)
+                        solved_retry, _ = solve_captcha_with_2captcha(driver)
+                        if not solved_retry:
+                            logger.error("[STEP] ✗✗✗ CAPTCHA solving failed after retry")
+                            return False, "CAPTCHA_SOLVE_FAILED", "CAPTCHA detected after password submission and 2Captcha solving failed"
+                    else:
+                        logger.info("[STEP] ✓ CAPTCHA cleared after solving! Proceeding...")
+                else:
+                    logger.error(f"[STEP] ✗✗✗ CAPTCHA solving failed: {solve_error}")
+                    return False, "CAPTCHA_DETECTED", f"CAPTCHA detected after password submission. 2Captcha solving failed: {solve_error}"
             
             # Check for account verification/ID verification required
             if "speedbump/idvreenable" in current_url or "idvreenable" in current_url:
@@ -1487,7 +1917,18 @@ def login_google(driver, email, password, known_totp_secret=None):
                     # Check for captcha
                     if detect_captcha(driver):
                         logger.warning("[STEP] ⚠️ CAPTCHA detected on 2SV authenticator page!")
-                        return False, None, "CAPTCHA_DETECTED", "CAPTCHA detected on 2SV authenticator page."
+                        
+                        # Try to solve CAPTCHA using 2Captcha if enabled
+                        solved, solve_error = solve_captcha_with_2captcha(driver)
+                        
+                        if solved:
+                            logger.info("[STEP] ✓✓✓ CAPTCHA solved using 2Captcha! Continuing...")
+                            time.sleep(3)
+                            driver.refresh()
+                            time.sleep(2)
+                        else:
+                            logger.error(f"[STEP] ✗✗✗ CAPTCHA solving failed: {solve_error}")
+                            return False, None, "CAPTCHA_DETECTED", f"CAPTCHA detected on 2SV authenticator page. 2Captcha solving failed: {solve_error}"
                     time.sleep(2)
                 except Exception as e:
                     logger.warning(f"[STEP] Could not navigate from twosvrequired: {e}")
@@ -1998,7 +2439,19 @@ def enable_two_step_verification(driver, email):
         # Check for captcha
         if detect_captcha(driver):
             logger.warning("[STEP] ⚠️ CAPTCHA detected on 2SV page!")
-            return False, None, "CAPTCHA_DETECTED", "CAPTCHA detected on 2SV page. Manual intervention required."
+            
+            # Try to solve CAPTCHA using 2Captcha if enabled
+            solved, solve_error = solve_captcha_with_2captcha(driver)
+            
+            if solved:
+                logger.info("[STEP] ✓✓✓ CAPTCHA solved using 2Captcha! Continuing...")
+                time.sleep(3)
+                # Refresh page to ensure CAPTCHA is cleared
+                driver.refresh()
+                time.sleep(2)
+            else:
+                logger.error(f"[STEP] ✗✗✗ CAPTCHA solving failed: {solve_error}")
+                return False, None, "CAPTCHA_DETECTED", f"CAPTCHA detected on 2SV page. 2Captcha solving failed: {solve_error}"
         time.sleep(3)
         
         # Check if 2-step verification is already enabled
@@ -2098,7 +2551,19 @@ def generate_app_password(driver, email):
         # Check for captcha
         if detect_captcha(driver):
             logger.warning("[STEP] ⚠️ CAPTCHA detected on app passwords page!")
-            return False, "CAPTCHA_DETECTED", "CAPTCHA detected on app passwords page. Manual intervention required."
+            
+            # Try to solve CAPTCHA using 2Captcha if enabled
+            solved, solve_error = solve_captcha_with_2captcha(driver)
+            
+            if solved:
+                logger.info("[STEP] ✓✓✓ CAPTCHA solved using 2Captcha! Continuing...")
+                time.sleep(3)
+                # Refresh page to ensure CAPTCHA is cleared
+                driver.refresh()
+                time.sleep(2)
+            else:
+                logger.error(f"[STEP] ✗✗✗ CAPTCHA solving failed: {solve_error}")
+                return False, None, "CAPTCHA_DETECTED", f"CAPTCHA detected on app passwords page. 2Captcha solving failed: {solve_error}"
         
         # Wait for page to be ready
         try:
@@ -2539,6 +3004,16 @@ def handler(event, context):
             """Wrapper function to process a single user with proper error handling"""
             email = user_data.get("email", "").strip()
             password = user_data.get("password", "").strip()
+            
+            # Get proxy for this user (rotation happens automatically)
+            proxy = get_rotated_proxy_for_user()
+            if proxy:
+                logger.info(f"[PROXY] [{email}] Using proxy: {proxy['ip']}:{proxy['port']}")
+                # Set proxy in environment for this user's Chrome driver
+                os.environ['PROXY_CONFIG'] = proxy['full']
+            else:
+                # Clear proxy config if not available
+                os.environ.pop('PROXY_CONFIG', None)
             
             if not email or not password:
                 return {
