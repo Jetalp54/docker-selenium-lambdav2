@@ -214,18 +214,100 @@ def get_chrome_driver():
         # Wait for Chrome to fully initialize
         time.sleep(2)
         
-        # Inject anti-detection scripts AFTER driver is stable
+        # Inject comprehensive anti-detection scripts AFTER driver is stable
         # Do this BEFORE any navigation to ensure it's applied to all pages
         try:
+            # Enhanced anti-detection script with multiple techniques
+            anti_detection_script = '''
+                // Hide webdriver property
+                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+                
+                // Spoof plugins
+                Object.defineProperty(navigator, 'plugins', {
+                    get: () => [1, 2, 3, 4, 5],
+                    configurable: true
+                });
+                
+                // Spoof languages
+                Object.defineProperty(navigator, 'languages', {
+                    get: () => ['en-US', 'en'],
+                    configurable: true
+                });
+                
+                // Spoof platform
+                Object.defineProperty(navigator, 'platform', {
+                    get: () => 'Win32',
+                    configurable: true
+                });
+                
+                // Add chrome runtime
+                window.chrome = {runtime: {}};
+                
+                // Spoof permissions
+                const originalQuery = window.navigator.permissions.query;
+                window.navigator.permissions.query = (parameters) => (
+                    parameters.name === 'notifications' ?
+                        Promise.resolve({ state: Notification.permission }) :
+                        originalQuery(parameters)
+                );
+                
+                // Spoof WebGL vendor and renderer
+                const getParameter = WebGLRenderingContext.prototype.getParameter;
+                WebGLRenderingContext.prototype.getParameter = function(parameter) {
+                    if (parameter === 37445) {
+                        return 'Intel Inc.';
+                    }
+                    if (parameter === 37446) {
+                        return 'Intel Iris OpenGL Engine';
+                    }
+                    return getParameter.call(this, parameter);
+                };
+                
+                // Override permissions API
+                if (navigator.permissions && navigator.permissions.query) {
+                    const originalQuery = navigator.permissions.query;
+                    navigator.permissions.query = function(params) {
+                        return originalQuery.call(this, params).catch(() => ({ state: 'prompt' }));
+                    };
+                }
+                
+                // Randomize canvas fingerprinting
+                const originalToDataURL = HTMLCanvasElement.prototype.toDataURL;
+                HTMLCanvasElement.prototype.toDataURL = function() {
+                    const context = this.getContext('2d');
+                    if (context) {
+                        const imageData = context.getImageData(0, 0, this.width, this.height);
+                        for (let i = 0; i < imageData.data.length; i += 4) {
+                            imageData.data[i] += Math.floor(Math.random() * 3) - 1;
+                        }
+                        context.putImageData(imageData, 0, 0);
+                    }
+                    return originalToDataURL.apply(this, arguments);
+                };
+                
+                // Add realistic mouse movement simulation
+                let mouseMoveCount = 0;
+                document.addEventListener('DOMContentLoaded', function() {
+                    setInterval(function() {
+                        if (mouseMoveCount < 5) {
+                            const event = new MouseEvent('mousemove', {
+                                view: window,
+                                bubbles: true,
+                                cancelable: true,
+                                clientX: Math.random() * window.innerWidth,
+                                clientY: Math.random() * window.innerHeight
+                            });
+                            document.dispatchEvent(event);
+                            mouseMoveCount++;
+                        }
+                    }, 2000 + Math.random() * 3000);
+                });
+            '''
+            
             driver.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument', {
-                'source': '''
-                    Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-                    Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
-                    Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
-                    window.chrome = {runtime: {}};
-                '''
+                'source': anti_detection_script
             })
-            logger.info("[LAMBDA] Anti-detection script injected successfully")
+            logger.info("[LAMBDA] Enhanced anti-detection script injected successfully")
         except Exception as e:
             logger.warning(f"[LAMBDA] Could not inject anti-detection script (non-critical): {e}")
             # Continue anyway - this is not critical, but log it
@@ -264,6 +346,84 @@ def get_chrome_driver():
             logger.error(traceback.format_exc())
             raise Exception(f"Chrome driver initialization failed: {e2}. Chrome: {chrome_binary}, ChromeDriver: {chromedriver_path}")
 
+
+# =====================================================================
+# Anti-Detection Helper Functions
+# =====================================================================
+
+def random_scroll_and_mouse_move(driver):
+    """Perform random scroll and mouse movements to simulate human behavior"""
+    try:
+        # Random scroll
+        scroll_amount = random.randint(100, 500)
+        driver.execute_script(f"window.scrollBy(0, {scroll_amount});")
+        time.sleep(random.uniform(0.3, 0.8))
+        
+        # Random mouse move simulation via JavaScript
+        driver.execute_script("""
+            const event = new MouseEvent('mousemove', {
+                view: window,
+                bubbles: true,
+                cancelable: true,
+                clientX: Math.random() * window.innerWidth,
+                clientY: Math.random() * window.innerHeight
+            });
+            document.dispatchEvent(event);
+        """)
+        time.sleep(random.uniform(0.2, 0.5))
+    except Exception as e:
+        logger.debug(f"[ANTI-DETECT] Random scroll/mouse move failed: {e}")
+
+def adaptive_wait(driver, condition, timeout=8):
+    """Optimized adaptive wait with shorter timeout"""
+    try:
+        return WebDriverWait(driver, timeout).until(condition)
+    except TimeoutException:
+        return None
+
+def inject_randomized_javascript(driver):
+    """Inject randomized JavaScript to make detection harder"""
+    try:
+        script = """
+        // Modify navigator properties to make detection harder
+        Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+        Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
+        Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3]});
+        Object.defineProperty(navigator, 'platform', {get: () => 'Win32'});
+        
+        // Randomize the timing of JavaScript actions
+        setTimeout(function() {
+            console.log("Randomized action");
+        }, Math.floor(Math.random() * 3000) + 500);
+        
+        // Random mouse movements
+        document.addEventListener('mousemove', function(e) {
+            let randomX = Math.random() * window.innerWidth;
+            let randomY = Math.random() * window.innerHeight;
+            window.scrollBy(randomX, randomY);
+        });
+        """
+        driver.execute_script(script)
+        logger.debug("[ANTI-DETECT] Randomized JavaScript injected")
+    except Exception as e:
+        logger.debug(f"[ANTI-DETECT] Failed to inject randomized JS: {e}")
+
+def simulate_human_typing(element, text, driver):
+    """Simulate human-like typing with random delays"""
+    try:
+        element.clear()
+        time.sleep(random.uniform(0.1, 0.3))
+        for char in text:
+            element.send_keys(char)
+            time.sleep(random.uniform(0.05, 0.15))  # Random delay between keystrokes
+        logger.debug(f"[ANTI-DETECT] Simulated human typing for {len(text)} characters")
+    except Exception as e:
+        logger.warning(f"[ANTI-DETECT] Human typing simulation failed, using normal send_keys: {e}")
+        element.send_keys(text)
+
+def add_random_delays():
+    """Add random delays to simulate human behavior"""
+    time.sleep(random.uniform(0.5, 1.5))
 
 # =====================================================================
 # Selenium Helper Functions
@@ -321,41 +481,76 @@ def wait_for_password_clickable(driver, by_method, selector, timeout=10):
         return None
 
 def detect_captcha(driver):
-    """Detect if Google CAPTCHA is present on the page"""
+    """Detect if Google CAPTCHA is present on the page - more accurate detection to avoid false positives"""
     try:
-        # Common CAPTCHA indicators
-        captcha_indicators = [
-            "//div[contains(@class, 'captcha')]",
-            "//div[contains(@id, 'captcha')]",
-            "//iframe[contains(@src, 'recaptcha')]",
-            "//div[contains(@class, 'recaptcha')]",
-            "//div[contains(text(), 'unusual traffic')]",
-            "//div[contains(text(), 'verify you')]",
-            "//div[contains(text(), 'verify that you')]",
-            "//span[contains(text(), 'unusual traffic')]",
-            "//span[contains(text(), 'verify you')]",
-            "//*[contains(text(), 'Try again later')]",
-            "//*[contains(text(), 'automated queries')]",
+        # First check for explicit CAPTCHA iframes (most reliable indicator)
+        try:
+            captcha_iframes = driver.find_elements(By.XPATH, "//iframe[contains(@src, 'recaptcha') or contains(@src, 'google.com/recaptcha')]")
+            if captcha_iframes:
+                # Check if iframe is actually visible
+                for iframe in captcha_iframes:
+                    try:
+                        if iframe.is_displayed():
+                            logger.warning("[CAPTCHA] Detected visible reCAPTCHA iframe")
+                            return True
+                    except:
+                        continue
+        except:
+            pass
+        
+        # Check for CAPTCHA-specific error messages (high confidence)
+        high_confidence_indicators = [
+            "//div[contains(text(), 'unusual traffic from your computer network')]",
+            "//div[contains(text(), 'automated queries')]",
+            "//div[contains(text(), 'verify you') and contains(text(), 'not a robot')]",
+            "//span[contains(text(), 'unusual traffic from your computer network')]",
+            "//span[contains(text(), 'automated queries')]",
+            "//*[contains(text(), 'Try again later') and contains(text(), 'automated')]",
         ]
         
-        for indicator in captcha_indicators:
+        for indicator in high_confidence_indicators:
             try:
                 elements = driver.find_elements(By.XPATH, indicator)
                 if elements:
-                    logger.warning(f"[CAPTCHA] Detected CAPTCHA indicator: {indicator}")
-                    return True
+                    # Verify element is visible
+                    for element in elements:
+                        try:
+                            if element.is_displayed():
+                                logger.warning(f"[CAPTCHA] Detected CAPTCHA message: {indicator}")
+                                return True
+                        except:
+                            continue
             except:
                 continue
         
-        # Also check page source for common CAPTCHA text
-        page_source = driver.page_source.lower()
-        captcha_keywords = ['captcha', 'recaptcha', 'unusual traffic', 'verify you', 'automated queries', 'try again later']
-        for keyword in captcha_keywords:
-            if keyword in page_source:
-                # Double-check it's actually a CAPTCHA, not just text
-                if any(indicator in page_source for indicator in ['recaptcha', 'captcha', 'verify']):
-                    logger.warning(f"[CAPTCHA] Detected CAPTCHA keyword in page source: {keyword}")
+        # Check for reCAPTCHA challenge container (more specific than generic captcha class)
+        try:
+            recaptcha_containers = driver.find_elements(By.XPATH, "//div[contains(@class, 'rc-') or contains(@id, 'recaptcha')]")
+            if recaptcha_containers:
+                # Only return True if we also see CAPTCHA-related text
+                page_text = driver.page_source.lower()
+                if any(keyword in page_text for keyword in ['verify', 'robot', 'unusual traffic', 'automated']):
+                    logger.warning("[CAPTCHA] Detected reCAPTCHA container with related text")
                     return True
+        except:
+            pass
+        
+        # Last resort: check page source for multiple CAPTCHA indicators together (reduces false positives)
+        page_source = driver.page_source.lower()
+        captcha_keywords_found = []
+        
+        # Look for specific high-confidence phrases
+        if 'unusual traffic from your computer network' in page_source:
+            captcha_keywords_found.append('unusual traffic')
+        if 'automated queries' in page_source and 'verify' in page_source:
+            captcha_keywords_found.append('automated queries + verify')
+        if 'try again later' in page_source and ('automated' in page_source or 'robot' in page_source):
+            captcha_keywords_found.append('try again + automated/robot')
+        
+        # Only return True if we found multiple strong indicators
+        if len(captcha_keywords_found) >= 1 and ('recaptcha' in page_source or 'captcha' in page_source):
+            logger.warning(f"[CAPTCHA] Detected CAPTCHA indicators in page source: {', '.join(captcha_keywords_found)}")
+            return True
         
         return False
     except Exception as e:
@@ -687,26 +882,41 @@ def login_google(driver, email, password, known_totp_secret=None):
         logger.info("[STEP] Navigating to Google login page (English)...")
         driver.get("https://accounts.google.com/signin/v2/identifier?hl=en&flowName=GlifWebSignIn")
         logger.info("[STEP] Navigation to Google login page completed")
-        time.sleep(2)  # Reduced wait time
+        
+        # Add random delay to simulate human behavior
+        add_random_delays()
+        
+        # Inject additional anti-detection scripts after page load
+        inject_randomized_javascript(driver)
+        
+        # Perform random scroll and mouse movements
+        random_scroll_and_mouse_move(driver)
+        
+        time.sleep(1)  # Additional wait for page to stabilize
         logger.info("[STEP] Page stabilized, proceeding with login")
         
-        # Check for captcha immediately after page load
-        if detect_captcha(driver):
-            logger.warning("[STEP] ⚠️ CAPTCHA detected on login page!")
-            return False, "CAPTCHA_DETECTED", "CAPTCHA detected on login page. Manual intervention required."
+        # NOTE: CAPTCHA check removed from here - CAPTCHA rarely appears before email entry
+        # CAPTCHA typically appears after email submission, so we'll check after that
     except Exception as nav_error:
         logger.error(f"[STEP] Navigation failed: {nav_error}")
         logger.error(traceback.format_exc())
         return False, "navigation_failed", str(nav_error)
 
     try:
-        # Enter email
+        # Enter email with human-like behavior
         email_input = wait_for_xpath(driver, "//input[@id='identifierId']", timeout=30)
+        
+        # Random scroll before interaction
+        random_scroll_and_mouse_move(driver)
+        
         email_input.clear()
-        time.sleep(0.5)
-        email_input.send_keys(email)
-        logger.info("[STEP] Email entered")
-        time.sleep(1)
+        add_random_delays()
+        
+        # Simulate human typing for email
+        simulate_human_typing(email_input, email, driver)
+        logger.info("[STEP] Email entered with human-like typing")
+        
+        add_random_delays()
         
         # Click Next button
         email_next_xpaths = [
@@ -723,7 +933,18 @@ def login_google(driver, email, password, known_totp_secret=None):
         logger.info("[STEP] Email submitted")
 
         # Wait for password field - reduced wait time
-        time.sleep(1)  # Reduced from 3 to 1 second
+        time.sleep(2)  # Wait for page to transition after email submission
+        
+        # Add human-like behavior after email submission
+        add_random_delays()
+        random_scroll_and_mouse_move(driver)
+        
+        # Check for CAPTCHA after email submission (this is when it typically appears)
+        if detect_captcha(driver):
+            logger.warning("[STEP] ⚠️ CAPTCHA detected after email submission!")
+            return False, "CAPTCHA_DETECTED", "CAPTCHA detected after email submission. Manual intervention required."
+        
+        time.sleep(1)  # Additional wait for password field to appear
         
         # Check for iframes first (Google sometimes uses iframes for password field)
         password_input = None
@@ -877,6 +1098,10 @@ def login_google(driver, email, password, known_totp_secret=None):
             password_input.send_keys(Keys.RETURN)
         logger.info("[STEP] Password submitted")
 
+        # Add human-like behavior after password submission
+        add_random_delays()
+        random_scroll_and_mouse_move(driver)
+
         # Wait for potential challenge pages, intermediate pages, or account home
         # Google may show: speedbump, verification, phone prompt, TOTP, recovery email, etc.
         # We'll wait longer and handle what we can, skip what we can't
@@ -886,12 +1111,22 @@ def login_google(driver, email, password, known_totp_secret=None):
         
         for attempt in range(max_wait_attempts):
             time.sleep(wait_interval)
+            
+            # Add occasional random behavior during wait
+            if attempt % 3 == 0:
+                random_scroll_and_mouse_move(driver)
+            
             try:
                 current_url = driver.current_url
                 logger.info(f"[STEP] Post-login check {attempt + 1}/{max_wait_attempts}: URL = {current_url}")
             except Exception as e:
                 logger.error(f"[STEP] Failed to get current URL: {e}")
                 return False, "driver_crashed", f"Driver crashed while checking URL: {e}"
+            
+            # Check for CAPTCHA after password submission (this is another common place for CAPTCHA)
+            if detect_captcha(driver):
+                logger.warning("[STEP] ⚠️ CAPTCHA detected after password submission!")
+                return False, "CAPTCHA_DETECTED", "CAPTCHA detected after password submission. Manual intervention required."
             
             # Check for account verification/ID verification required
             if "speedbump/idvreenable" in current_url or "idvreenable" in current_url:
@@ -1123,13 +1358,22 @@ def setup_authenticator(driver, email):
     Based on reference script G_Ussers_No_Timing.py
     Returns (success: bool, secret_key: str|None, error_code: str|None, error_message: str|None)
     """
+    # Add human-like behavior before navigating
+    add_random_delays()
+    random_scroll_and_mouse_move(driver)
     logger.info(f"[STEP] Setting up Authenticator for {email}")
     
     try:
         # Navigate to authenticator setup page
         logger.info("[STEP] Navigating to Authenticator setup page...")
         driver.get("https://myaccount.google.com/two-step-verification/authenticator?hl=en")
-        time.sleep(3)
+        
+        # Add human-like behavior after page load
+        add_random_delays()
+        random_scroll_and_mouse_move(driver)
+        inject_randomized_javascript(driver)
+        
+        time.sleep(2)  # Reduced from 3 to 2
         
         # Step 1: Click "Set up authenticator" button
         # Try multiple XPath patterns for the setup button
@@ -1548,6 +1792,11 @@ def generate_app_password(driver, email):
         
         # Navigate to app passwords page with hl=en for English
         driver.get("https://myaccount.google.com/apppasswords?hl=en")
+        
+        # Add human-like behavior after page load
+        add_random_delays()
+        random_scroll_and_mouse_move(driver)
+        inject_randomized_javascript(driver)
         
         # Check for captcha
         if detect_captcha(driver):
@@ -1971,14 +2220,14 @@ def handler(event, context):
                 "results": []
             }
         
-        if len(users_batch) > 10:
-            return {
-                "status": "failed",
-                "error_message": f"Too many users in batch: {len(users_batch)}. Maximum is 10.",
-                "results": []
-            }
+        # CRITICAL: Enforce 10-user limit - truncate if exceeded
+        MAX_USERS_PER_BATCH = 10
+        if len(users_batch) > MAX_USERS_PER_BATCH:
+            logger.warning(f"[LAMBDA] ⚠️ WARNING: Batch has {len(users_batch)} users, exceeding limit of {MAX_USERS_PER_BATCH}!")
+            logger.warning(f"[LAMBDA] Truncating batch to {MAX_USERS_PER_BATCH} users")
+            users_batch = users_batch[:MAX_USERS_PER_BATCH]
         
-        logger.info(f"[LAMBDA] Batch processing mode: {len(users_batch)} user(s)")
+        logger.info(f"[LAMBDA] Batch processing mode: {len(users_batch)} user(s) (MAX: {MAX_USERS_PER_BATCH})")
         logger.info(f"[LAMBDA] Starting PARALLEL processing of {len(users_batch)} user(s)")
         
         # Ensure DynamoDB table exists before processing
