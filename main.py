@@ -1012,6 +1012,13 @@ def solve_recaptcha_v2(driver, api_key, site_key=None, page_url=None):
                 if submit_result.get('status') != 1:
                     error_msg = submit_result.get('request', 'Unknown error')
                     logger.error(f"[2CAPTCHA] Failed to submit CAPTCHA: {error_msg}")
+                    
+                    # Check for specific error codes that indicate API key issues
+                    if 'ERROR_ZERO_CAPTCHA_FILESIZE' in error_msg or 'ERROR_WRONG_USER_KEY' in error_msg or 'ERROR_KEY_DOES_NOT_EXIST' in error_msg:
+                        logger.error(f"[2CAPTCHA] ⚠️ API Key Error: {error_msg}")
+                        logger.error(f"[2CAPTCHA] Please verify your 2Captcha API key is correct and has balance")
+                        return False, None, f"Invalid API key or no balance: {error_msg}"
+                    
                     return False, None, f"2Captcha submission failed: {error_msg}"
                 
                 task_id = submit_result.get('request')
@@ -1055,6 +1062,13 @@ def solve_recaptcha_v2(driver, api_key, site_key=None, page_url=None):
                     else:
                         error_msg = get_result.get('request', 'Unknown error')
                         logger.error(f"[2CAPTCHA] Error getting solution: {error_msg}")
+                        
+                        # Check for specific error codes that indicate API key issues
+                        if 'ERROR_ZERO_CAPTCHA_FILESIZE' in error_msg or 'ERROR_WRONG_USER_KEY' in error_msg or 'ERROR_KEY_DOES_NOT_EXIST' in error_msg:
+                            logger.error(f"[2CAPTCHA] ⚠️ API Key Error: {error_msg}")
+                            logger.error(f"[2CAPTCHA] Please verify your 2Captcha API key is correct and has balance")
+                            return False, None, f"Invalid API key or no balance: {error_msg}"
+                        
                         return False, None, f"2Captcha solution error: {error_msg}"
             except Exception as e:
                 logger.warning(f"[2CAPTCHA] Error polling for solution: {e}")
