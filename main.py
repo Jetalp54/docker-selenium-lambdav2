@@ -30,6 +30,7 @@ import boto3
 from botocore.exceptions import ClientError
 import paramiko
 import pyotp
+from fake_useragent import UserAgent
 
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -113,6 +114,82 @@ import threading
 _proxy_list_cache = None
 _proxy_rotation_counter = 0
 _proxy_lock = threading.Lock()
+
+# Global UserAgent instance (cached for performance)
+_user_agent_cache = None
+_ua_lock = threading.Lock()
+
+def get_user_agent():
+    """Get a random realistic User-Agent using fake_useragent library
+    
+    Uses fake_useragent to generate realistic, up-to-date User-Agents.
+    Falls back to hardcoded list if fake_useragent fails (e.g., offline in Lambda).
+    """
+    global _user_agent_cache
+    
+    with _ua_lock:
+        if _user_agent_cache is None:
+            try:
+                # Try to create UserAgent instance
+                # In Lambda, we use cache=True to use cached database (if available)
+                # If cache doesn't exist, it will download once and cache it
+                # Use verify_ssl=False for Lambda environments that may have SSL issues
+                try:
+                    _user_agent_cache = UserAgent(
+                        cache=True,  # Use cache to avoid re-downloading
+                        verify_ssl=False,  # Lambda may have SSL certificate issues
+                        fallback='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
+                    )
+                    # Test if it works by getting one UA
+                    _user_agent_cache.random
+                    logger.info("[USER-AGENT] ✓ fake_useragent initialized successfully")
+                except Exception as init_err:
+                    logger.warning(f"[USER-AGENT] Initial UserAgent creation failed: {init_err}")
+                    # Try with cache=False as fallback
+                    try:
+                        _user_agent_cache = UserAgent(cache=False, verify_ssl=False)
+                        _user_agent_cache.random
+                        logger.info("[USER-AGENT] ✓ fake_useragent initialized with cache=False")
+                    except Exception as fallback_err:
+                        logger.warning(f"[USER-AGENT] Both initialization methods failed: {fallback_err}")
+                        _user_agent_cache = None
+            except Exception as e:
+                logger.warning(f"[USER-AGENT] Failed to initialize fake_useragent: {e}, using fallback")
+                # Fallback to hardcoded list if fake_useragent fails
+                _user_agent_cache = None
+        
+        # Get random User-Agent
+        try:
+            if _user_agent_cache:
+                # Try to get Chrome-specific User-Agent for better compatibility
+                try:
+                    ua = _user_agent_cache.chrome  # Get Chrome-specific UA
+                except:
+                    ua = _user_agent_cache.random  # Fallback to random
+                
+                # Validate UA is reasonable (should contain Mozilla and Chrome)
+                if ua and 'Mozilla' in ua and ('Chrome' in ua or 'chromium' in ua.lower()):
+                    logger.debug(f"[USER-AGENT] Generated User-Agent: {ua[:60]}...")
+                    return ua
+                else:
+                    logger.warning(f"[USER-AGENT] Invalid UA generated: {ua[:60]}..., using fallback")
+                    raise ValueError("Invalid User-Agent generated")
+            else:
+                # Fallback to hardcoded list if fake_useragent not available
+                fallback_agents = [
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+                    "Mozilla/5.0 (Windows NT 11.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36",
+                ]
+                selected = random.choice(fallback_agents)
+                logger.debug(f"[USER-AGENT] Using fallback User-Agent: {selected[:60]}...")
+                return selected
+        except Exception as e:
+            logger.warning(f"[USER-AGENT] Error getting User-Agent: {e}, using fallback")
+            return "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 
 def get_proxy_list_from_env():
     """Get and parse proxy list from environment variable"""
@@ -301,14 +378,37 @@ def get_chrome_driver():
     chrome_options.add_argument("--disable-setuid-sandbox")
     chrome_options.add_argument("--disable-software-rasterizer")
     
-    # Anti-detection options (Lambda-compatible)
+    # ADVANCED Anti-detection options (Lambda-compatible)
+    # These are critical for avoiding bot detection
     chrome_options.add_argument("--disable-blink-features=AutomationControlled")
-    chrome_options.add_experimental_option("excludeSwitches", ["enable-automation", "enable-logging"])
+    chrome_options.add_argument("--disable-features=IsolateOrigins,site-per-process")
+    chrome_options.add_argument("--disable-site-isolation-trials")
+    chrome_options.add_argument("--disable-web-security")  # Helps with some detection bypasses
+    chrome_options.add_argument("--disable-features=VizDisplayCompositor")
+    
+    # Exclude automation switches (CRITICAL for stealth)
+    chrome_options.add_experimental_option("excludeSwitches", [
+        "enable-automation",
+        "enable-logging",
+        "enable-blink-features=AutomationControlled"
+    ])
+    
+    # Disable automation extension
     chrome_options.add_experimental_option('useAutomationExtension', False)
+    
+    # Set preferences to mimic real user
     chrome_options.add_experimental_option("prefs", {
         "profile.default_content_setting_values.notifications": 2,
         "profile.default_content_settings.popups": 0,
+        "profile.managed_default_content_settings.images": 1,  # Allow images
+        "credentials_enable_service": False,
+        "password_manager_enabled": False,
     })
+    
+    # Add random but realistic User-Agent using fake_useragent
+    selected_ua = get_user_agent()
+    chrome_options.add_argument(f"--user-agent={selected_ua}")
+    logger.info(f"[LAMBDA] Using User-Agent: {selected_ua[:60]}...")
 
     try:
         # Create Service with explicit ChromeDriver path
@@ -334,102 +434,322 @@ def get_chrome_driver():
         # Wait for Chrome to fully initialize
         time.sleep(2)
         
-        # Inject comprehensive anti-detection scripts AFTER driver is stable
-        # Do this BEFORE any navigation to ensure it's applied to all pages
+        # Inject ADVANCED anti-detection scripts (stealth.min.js inspired approach)
+        # This is the MOST comprehensive anti-detection available for Lambda environment
         try:
-            # Enhanced anti-detection script with multiple techniques
-            anti_detection_script = '''
-                // Hide webdriver property
-                    Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-                
-                // Spoof plugins
-                Object.defineProperty(navigator, 'plugins', {
-                    get: () => [1, 2, 3, 4, 5],
+            # Generate random but realistic browser fingerprint
+            # This makes each session unique and harder to detect
+            random_seed = random.randint(1000, 9999)
+            
+            # Get realistic User-Agent using fake_useragent (more variety than hardcoded list)
+            selected_ua = get_user_agent()
+            
+            # Generate random hardware specs (realistic values)
+            hardware_cores = random.choice([4, 8, 12, 16])
+            device_memory = random.choice([4, 8, 16])
+            
+            # Advanced stealth script (based on stealth.min.js principles)
+            advanced_stealth_script = f'''
+            (function() {{
+                // ===== CORE WEBDRIVER DETECTION REMOVAL =====
+                // Remove webdriver property completely
+                Object.defineProperty(navigator, 'webdriver', {{
+                    get: () => undefined,
                     configurable: true
-                });
+                }});
                 
-                // Spoof languages
-                Object.defineProperty(navigator, 'languages', {
+                // Remove automation indicators
+                delete window.cdc_adoQpoasnfa76pfcZLmcfl_Array;
+                delete window.cdc_adoQpoasnfa76pfcZLmcfl_Promise;
+                delete window.cdc_adoQpoasnfa76pfcZLmcfl_Symbol;
+                
+                // ===== NAVIGATOR PROPERTIES SPOOFING =====
+                // Realistic plugins array
+                Object.defineProperty(navigator, 'plugins', {{
+                    get: () => {{
+                        const plugins = [
+                            {{ name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer', description: 'Portable Document Format' }},
+                            {{ name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai', description: '' }},
+                            {{ name: 'Native Client', filename: 'internal-nacl-plugin', description: '' }}
+                        ];
+                        return plugins;
+                    }},
+                    configurable: true
+                }});
+                
+                // Realistic languages
+                Object.defineProperty(navigator, 'languages', {{
                     get: () => ['en-US', 'en'],
                     configurable: true
-                });
+                }});
                 
-                // Spoof platform
-                Object.defineProperty(navigator, 'platform', {
+                // Platform spoofing
+                Object.defineProperty(navigator, 'platform', {{
                     get: () => 'Win32',
                     configurable: true
-                });
+                }});
                 
-                // Add chrome runtime
-                    window.chrome = {runtime: {}};
+                // Hardware concurrency (realistic CPU cores)
+                Object.defineProperty(navigator, 'hardwareConcurrency', {{
+                    get: () => {hardware_cores},
+                    configurable: true
+                }});
                 
-                // Spoof permissions
+                // Device memory (realistic RAM)
+                Object.defineProperty(navigator, 'deviceMemory', {{
+                    get: () => {device_memory},
+                    configurable: true
+                }});
+                
+                // ===== CHROME RUNTIME SPOOFING =====
+                window.chrome = {{
+                    runtime: {{}},
+                    loadTimes: function() {{}},
+                    csi: function() {{}},
+                    app: {{}}
+                }};
+                
+                // ===== PERMISSIONS API OVERRIDE =====
                 const originalQuery = window.navigator.permissions.query;
-                window.navigator.permissions.query = (parameters) => (
-                    parameters.name === 'notifications' ?
-                        Promise.resolve({ state: Notification.permission }) :
-                        originalQuery(parameters)
-                );
+                window.navigator.permissions.query = function(parameters) {{
+                    return parameters.name === 'notifications' ?
+                        Promise.resolve({{ state: Notification.permission }}) :
+                        originalQuery(parameters);
+                }};
                 
-                // Spoof WebGL vendor and renderer
+                // ===== WEBGL FINGERPRINT SPOOFING =====
                 const getParameter = WebGLRenderingContext.prototype.getParameter;
-                WebGLRenderingContext.prototype.getParameter = function(parameter) {
-                    if (parameter === 37445) {
+                WebGLRenderingContext.prototype.getParameter = function(parameter) {{
+                    if (parameter === 37445) {{
                         return 'Intel Inc.';
-                    }
-                    if (parameter === 37446) {
+                    }}
+                    if (parameter === 37446) {{
                         return 'Intel Iris OpenGL Engine';
-                    }
+                    }}
+                    if (parameter === 7936) {{
+                        return 'WebGL 1.0';
+                    }}
+                    if (parameter === 7937) {{
+                        return 'WebGL GLSL ES 1.0';
+                    }}
+                    if (parameter === 7938) {{
+                        return 'WebGL GLSL ES 1.0';
+                    }}
                     return getParameter.call(this, parameter);
-                };
+                }};
                 
-                // Override permissions API
-                if (navigator.permissions && navigator.permissions.query) {
-                    const originalQuery = navigator.permissions.query;
-                    navigator.permissions.query = function(params) {
-                        return originalQuery.call(this, params).catch(() => ({ state: 'prompt' }));
-                    };
-                }
+                // WebGL2 context spoofing
+                if (window.WebGL2RenderingContext) {{
+                    const getParameter2 = WebGL2RenderingContext.prototype.getParameter;
+                    WebGL2RenderingContext.prototype.getParameter = function(parameter) {{
+                        if (parameter === 37445) {{
+                            return 'Intel Inc.';
+                        }}
+                        if (parameter === 37446) {{
+                            return 'Intel Iris OpenGL Engine';
+                        }}
+                        return getParameter2.call(this, parameter);
+                    }};
+                }}
                 
-                // Randomize canvas fingerprinting
+                // ===== CANVAS FINGERPRINT RANDOMIZATION =====
                 const originalToDataURL = HTMLCanvasElement.prototype.toDataURL;
-                HTMLCanvasElement.prototype.toDataURL = function() {
-                    const context = this.getContext('2d');
-                    if (context) {
-                        const imageData = context.getImageData(0, 0, this.width, this.height);
-                        for (let i = 0; i < imageData.data.length; i += 4) {
-                            imageData.data[i] += Math.floor(Math.random() * 3) - 1;
-                        }
-                        context.putImageData(imageData, 0, 0);
-                    }
-                    return originalToDataURL.apply(this, arguments);
-                };
+                const originalGetImageData = CanvasRenderingContext2D.prototype.getImageData;
                 
-                // Add realistic mouse movement simulation
-                let mouseMoveCount = 0;
-                document.addEventListener('DOMContentLoaded', function() {
-                    setInterval(function() {
-                        if (mouseMoveCount < 5) {
-                            const event = new MouseEvent('mousemove', {
-                                view: window,
-                                bubbles: true,
-                                cancelable: true,
-                                clientX: Math.random() * window.innerWidth,
-                                clientY: Math.random() * window.innerHeight
-                            });
-                            document.dispatchEvent(event);
-                            mouseMoveCount++;
-                        }
-                    }, 2000 + Math.random() * 3000);
-                });
-            '''
+                HTMLCanvasElement.prototype.toDataURL = function() {{
+                    const context = this.getContext('2d');
+                    if (context) {{
+                        const imageData = context.getImageData(0, 0, this.width, this.height);
+                        // Add subtle noise to prevent fingerprinting
+                        for (let i = 0; i < imageData.data.length; i += 4) {{
+                            imageData.data[i] += Math.floor(Math.random() * 3) - 1;
+                            imageData.data[i + 1] += Math.floor(Math.random() * 3) - 1;
+                            imageData.data[i + 2] += Math.floor(Math.random() * 3) - 1;
+                        }}
+                        context.putImageData(imageData, 0, 0);
+                    }}
+                    return originalToDataURL.apply(this, arguments);
+                }};
+                
+                CanvasRenderingContext2D.prototype.getImageData = function() {{
+                    const imageData = originalGetImageData.apply(this, arguments);
+                    // Add noise to prevent fingerprinting
+                    for (let i = 0; i < imageData.data.length; i += 4) {{
+                        imageData.data[i] += Math.floor(Math.random() * 3) - 1;
+                    }}
+                    return imageData;
+                }};
+                
+                // ===== AUDIO CONTEXT FINGERPRINT SPOOFING =====
+                if (window.AudioContext || window.webkitAudioContext) {{
+                    const AudioContext = window.AudioContext || window.webkitAudioContext;
+                    const originalCreateAnalyser = AudioContext.prototype.createAnalyser;
+                    AudioContext.prototype.createAnalyser = function() {{
+                        const analyser = originalCreateAnalyser.apply(this, arguments);
+                        const originalGetFloatFrequencyData = analyser.getFloatFrequencyData;
+                        analyser.getFloatFrequencyData = function(array) {{
+                            originalGetFloatFrequencyData.apply(this, arguments);
+                            // Add noise to prevent audio fingerprinting
+                            for (let i = 0; i < array.length; i++) {{
+                                array[i] += (Math.random() - 0.5) * 0.0001;
+                            }}
+                        }};
+                        return analyser;
+                    }};
+                }}
+                
+                // ===== BATTERY API SPOOFING =====
+                if (navigator.getBattery) {{
+                    const originalGetBattery = navigator.getBattery;
+                    navigator.getBattery = function() {{
+                        return Promise.resolve({{
+                            charging: true,
+                            chargingTime: 0,
+                            dischargingTime: Infinity,
+                            level: 1.0
+                        }});
+                    }};
+                }}
+                
+                // ===== WEBRTC IP LEAK PREVENTION =====
+                const RTCPeerConnection = window.RTCPeerConnection || window.mozRTCPeerConnection || window.webkitRTCPeerConnection;
+                if (RTCPeerConnection) {{
+                    const originalCreateOffer = RTCPeerConnection.prototype.createOffer;
+                    RTCPeerConnection.prototype.createOffer = function() {{
+                        return originalCreateOffer.apply(this, arguments).then(offer => {{
+                            // Remove IP addresses from SDP
+                            offer.sdp = offer.sdp.replace(/\\r\\na=candidate.*\\r\\n/g, '');
+                            return offer;
+                        }});
+                    }};
+                }}
+                
+                // ===== MOUSE AND KEYBOARD EVENT SPOOFING =====
+                // Add realistic mouse movement tracking
+                let mouseEvents = [];
+                document.addEventListener('mousemove', function(e) {{
+                    mouseEvents.push({{ x: e.clientX, y: e.clientY, time: Date.now() }});
+                    if (mouseEvents.length > 100) mouseEvents.shift();
+                }}, true);
+                
+                // ===== CONSOLE OVERRIDE =====
+                // Prevent console detection
+                const originalLog = console.log;
+                console.log = function() {{
+                    // Silently log or modify output
+                    originalLog.apply(console, arguments);
+                }};
+                
+                // ===== TIMING ATTACK PREVENTION =====
+                // Randomize performance timing slightly
+                if (window.performance && window.performance.now) {{
+                    const originalNow = window.performance.now;
+                    window.performance.now = function() {{
+                        return originalNow.apply(this, arguments) + Math.random() * 0.1;
+                    }};
+                }}
+                
+                // ===== PLUGIN LENGTH SPOOFING =====
+                Object.defineProperty(navigator, 'pluginLength', {{
+                    get: () => 3,
+                    configurable: true
+                }});
+                
+                // ===== CONNECTION API SPOOFING =====
+                if (navigator.connection) {{
+                    Object.defineProperty(navigator, 'connection', {{
+                        get: () => ({{
+                            effectiveType: '4g',
+                            rtt: 50,
+                            downlink: 10,
+                            saveData: false
+                        }}),
+                        configurable: true
+                    }});
+                }}
+                
+                // ===== USER AGENT OVERRIDE =====
+                Object.defineProperty(navigator, 'userAgent', {{
+                    get: () => '{selected_ua}',
+                    configurable: true
+                }});
+                
+                // ===== VENDOR SPOOFING =====
+                Object.defineProperty(navigator, 'vendor', {{
+                    get: () => 'Google Inc.',
+                    configurable: true
+                }});
+                
+                // ===== MAX TOUCH POINTS =====
+                Object.defineProperty(navigator, 'maxTouchPoints', {{
+                    get: () => 0,
+                    configurable: true
+                }});
+                
+                // ===== NOTIFICATION PERMISSION =====
+                if (window.Notification) {{
+                    Object.defineProperty(Notification, 'permission', {{
+                        get: () => 'default',
+                        configurable: true
+                    }});
+                }}
+                
+                // ===== DOCUMENT PROPERTIES =====
+                Object.defineProperty(document, 'hidden', {{
+                    get: () => false,
+                    configurable: true
+                }});
+                
+                Object.defineProperty(document, 'visibilityState', {{
+                    get: () => 'visible',
+                    configurable: true
+                }});
+                
+                // ===== PREVENT AUTOMATION DETECTION =====
+                // Remove automation flags
+                Object.defineProperty(navigator, 'webdriver', {{
+                    get: () => false,
+                    configurable: true
+                }});
+                
+                // Override automation detection
+                window.navigator.webdriver = false;
+                delete window.navigator.__proto__.webdriver;
+                
+                // ===== FINAL CLEANUP =====
+                // Ensure all properties are properly set
+                if (!window.chrome) {{
+                    window.chrome = {{ runtime: {{}} }};
+                }}
+                
+                // Prevent detection via toString
+                const originalToString = Function.prototype.toString;
+                Function.prototype.toString = function() {{
+                    if (this === navigator.getBattery || this === navigator.connection) {{
+                        return 'function ' + this.name + '() {{ [native code] }}';
+                    }}
+                    return originalToString.apply(this, arguments);
+                }};
+            }})();
+            '''.format(hardware_cores=hardware_cores, device_memory=device_memory, selected_ua=selected_ua)
             
+            # Inject the advanced stealth script
             driver.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument', {
-                'source': anti_detection_script
+                'source': advanced_stealth_script
             })
-            logger.info("[LAMBDA] Enhanced anti-detection script injected successfully")
+            
+            # Also set User-Agent via CDP for better compatibility
+            driver.execute_cdp_cmd('Network.setUserAgentOverride', {
+                'userAgent': selected_ua
+            })
+            
+            # Enable domain to allow CDP commands
+            driver.execute_cdp_cmd('Network.enable', {})
+            driver.execute_cdp_cmd('Page.enable', {})
+            
+            logger.info(f"[LAMBDA] ✓✓✓ ADVANCED stealth script injected successfully (UA: {selected_ua[:50]}...)")
         except Exception as e:
-            logger.warning(f"[LAMBDA] Could not inject anti-detection script (non-critical): {e}")
+            logger.warning(f"[LAMBDA] Could not inject advanced stealth script (non-critical): {e}")
             # Continue anyway - this is not critical, but log it
         
         logger.info("[LAMBDA] Chrome driver created successfully")
