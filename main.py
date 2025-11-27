@@ -1768,9 +1768,9 @@ def login_google(driver, email, password, known_totp_secret=None):
         
         if not password_input:
             # Fallback: Try XPath methods (fixed invalid XPath syntax)
-            password_input_xpaths = [
-                "//input[@name='Passwd']",
-                "//input[@type='password']",
+        password_input_xpaths = [
+            "//input[@name='Passwd']",
+            "//input[@type='password']",
                 "/html/body/div[2]/div[1]/div[1]/div[2]/c-wiz/main/div[2]/div/div/div/form/span/section[2]/div/div/div[1]/div[1]/div/div/div/div/div[1]/div/div[1]/input",  # User-provided working XPath
                 "//input[@id='password']",
                 "//input[@name='password']",
@@ -2081,7 +2081,7 @@ def login_google(driver, email, password, known_totp_secret=None):
             
             # Try standard clear first
             try:
-                password_input.clear()
+        password_input.clear()
             except:
                 # If clear fails, use JavaScript
                 driver.execute_script("arguments[0].value = '';", password_input)
@@ -2882,18 +2882,18 @@ def generate_app_password(driver, email):
         for page_load_attempt in range(max_page_load_retries):
             try:
                 logger.info(f"[STEP] Attempting to load app password page (attempt {page_load_attempt + 1}/{max_page_load_retries})...")
-                driver.get("https://myaccount.google.com/apppasswords?hl=en")
-                
+        driver.get("https://myaccount.google.com/apppasswords?hl=en")
+        
                 # Wait for page to be ready with timeout
-                try:
+        try:
                     WebDriverWait(driver, 15).until(
-                        lambda d: d.execute_script("return document.readyState") == "complete"
-                    )
-                    time.sleep(2)  # Additional wait for dynamic content
+                lambda d: d.execute_script("return document.readyState") == "complete"
+            )
+            time.sleep(2)  # Additional wait for dynamic content
                     logger.info("[STEP] App passwords page loaded successfully")
                     app_password_page_loaded = True
                     break
-                except TimeoutException:
+        except TimeoutException:
                     logger.warning(f"[STEP] App passwords page load timeout on attempt {page_load_attempt + 1}")
                     if page_load_attempt < max_page_load_retries - 1:
                         # Check 2-step verification status before retrying
@@ -3605,8 +3605,8 @@ def handler(event, context):
     
     else:
         # Single user mode (backward compatible)
-        email = event.get("email", os.environ.get("GW_EMAIL"))
-        password = event.get("password", os.environ.get("GW_PASSWORD"))
+    email = event.get("email", os.environ.get("GW_EMAIL"))
+    password = event.get("password", os.environ.get("GW_PASSWORD"))
     
     if not email or not password:
         return {
