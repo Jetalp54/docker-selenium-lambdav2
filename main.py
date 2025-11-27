@@ -2861,7 +2861,182 @@ def generate_app_password(driver, email):
         logger.info("[STEP] Waiting for app password page to be ready (may take up to 30 seconds after enabling 2SV)...")
         
         # Navigate to app passwords page with hl=en for English
-        driver.get("https://myaccount.google.com/apppasswords?hl=en")
+        # Add timeout handling - if page doesn't load, check 2-step verification status
+        app_password_page_loaded = False
+        max_page_load_retries = 2
+        
+        for page_load_attempt in range(max_page_load_retries):
+            try:
+                logger.info(f"[STEP] Attempting to load app password page (attempt {page_load_attempt + 1}/{max_page_load_retries})...")
+                driver.get("https://myaccount.google.com/apppasswords?hl=en")
+                
+                # Wait for page to be ready with timeout
+                try:
+                    WebDriverWait(driver, 15).until(
+                        lambda d: d.execute_script("return document.readyState") == "complete"
+                    )
+                    time.sleep(2)  # Additional wait for dynamic content
+                    logger.info("[STEP] App passwords page loaded successfully")
+                    app_password_page_loaded = True
+                    break
+                except TimeoutException:
+                    logger.warning(f"[STEP] App passwords page load timeout on attempt {page_load_attempt + 1}")
+                    if page_load_attempt < max_page_load_retries - 1:
+                        # Check 2-step verification status before retrying
+                        logger.info("[STEP] Checking 2-step verification status before retry...")
+                        try:
+                            # Navigate to 2-step verification page
+                            driver.get("https://myaccount.google.com/signinoptions/twosv?hl=en")
+                            time.sleep(3)
+                            
+                            # Check for captcha on 2SV page
+                            if detect_captcha(driver):
+                                logger.warning("[STEP] ⚠️ CAPTCHA detected on 2SV page during check!")
+                                solved, solve_error = solve_captcha_with_2captcha(driver)
+                                if solved:
+                                    logger.info("[STEP] ✓✓✓ CAPTCHA solved! Continuing...")
+                                    time.sleep(3)
+                                    driver.refresh()
+                                    time.sleep(2)
+                                else:
+                                    logger.error(f"[STEP] ✗✗✗ CAPTCHA solving failed: {solve_error}")
+                            
+                            # Check if 2-step verification is enabled
+                            if element_exists(driver, "//button[contains(., 'Turn off')]", timeout=5):
+                                logger.info("[STEP] ✓ 2-Step Verification is already enabled. Retrying app password page...")
+                            else:
+                                logger.warning("[STEP] ⚠️ 2-Step Verification is NOT enabled. Enabling it now...")
+                                # Enable 2-step verification
+                                enable_success, error_code, error_msg = enable_two_step_verification(driver, email)
+                                if enable_success:
+                                    logger.info("[STEP] ✓ 2-Step Verification enabled successfully. Waiting 5 seconds before retrying app password page...")
+                                    time.sleep(5)  # Wait for changes to propagate
+                                else:
+                                    logger.error(f"[STEP] ✗ Failed to enable 2-Step Verification: {error_code} - {error_msg}")
+                                    return False, None, error_code or "2SV_ENABLE_FAILED", error_msg or "Failed to enable 2-Step Verification"
+                        except Exception as check_err:
+                            logger.error(f"[STEP] Error checking 2-step verification status: {check_err}")
+                            logger.error(traceback.format_exc())
+                    else:
+                        # Last attempt failed, proceed to check 2SV status anyway
+                        logger.warning("[STEP] All page load attempts failed. Checking 2-step verification status...")
+                        try:
+                            driver.get("https://myaccount.google.com/signinoptions/twosv?hl=en")
+                            time.sleep(3)
+                            
+                            # Check for captcha
+                            if detect_captcha(driver):
+                                logger.warning("[STEP] ⚠️ CAPTCHA detected on 2SV page!")
+                                solved, solve_error = solve_captcha_with_2captcha(driver)
+                                if solved:
+                                    logger.info("[STEP] ✓✓✓ CAPTCHA solved! Continuing...")
+                                    time.sleep(3)
+                                    driver.refresh()
+                                    time.sleep(2)
+                            
+                            # Check if 2-step verification is enabled
+                            if element_exists(driver, "//button[contains(., 'Turn off')]", timeout=5):
+                                logger.info("[STEP] ✓ 2-Step Verification is enabled. App password page may require manual intervention.")
+                            else:
+                                logger.warning("[STEP] ⚠️ 2-Step Verification is NOT enabled. Enabling it now...")
+                                enable_success, error_code, error_msg = enable_two_step_verification(driver, email)
+                                if enable_success:
+                                    logger.info("[STEP] ✓ 2-Step Verification enabled. Waiting 5 seconds before final retry...")
+                                    time.sleep(5)
+                                    # Final retry
+                                    try:
+                                        driver.get("https://myaccount.google.com/apppasswords?hl=en")
+                                        WebDriverWait(driver, 15).until(
+                                            lambda d: d.execute_script("return document.readyState") == "complete"
+                                        )
+                                        time.sleep(2)
+                                        logger.info("[STEP] App passwords page loaded after 2SV enable")
+                                        app_password_page_loaded = True
+                                    except TimeoutException:
+                                        logger.error("[STEP] App password page still not loading after enabling 2SV")
+                                        return False, None, "APP_PASSWORD_PAGE_TIMEOUT", "App password page failed to load even after enabling 2-Step Verification"
+                                else:
+                                    return False, None, error_code or "2SV_ENABLE_FAILED", error_msg or "Failed to enable 2-Step Verification"
+                        except Exception as final_check_err:
+                            logger.error(f"[STEP] Error in final 2SV check: {final_check_err}")
+                            logger.error(traceback.format_exc())
+            except TimeoutException as page_timeout:
+                logger.error(f"[STEP] Timeout loading app password page: {page_timeout}")
+                if page_load_attempt < max_page_load_retries - 1:
+                    # Check 2-step verification before retrying
+                    logger.info("[STEP] Checking 2-step verification status before retry...")
+                    try:
+                        driver.get("https://myaccount.google.com/signinoptions/twosv?hl=en")
+                        time.sleep(3)
+                        
+                        # Check for captcha
+                        if detect_captcha(driver):
+                            logger.warning("[STEP] ⚠️ CAPTCHA detected on 2SV page!")
+                            solved, solve_error = solve_captcha_with_2captcha(driver)
+                            if solved:
+                                logger.info("[STEP] ✓✓✓ CAPTCHA solved! Continuing...")
+                                time.sleep(3)
+                                driver.refresh()
+                                time.sleep(2)
+                        
+                        # Check if 2-step verification is enabled
+                        if element_exists(driver, "//button[contains(., 'Turn off')]", timeout=5):
+                            logger.info("[STEP] ✓ 2-Step Verification is already enabled. Retrying app password page...")
+                        else:
+                            logger.warning("[STEP] ⚠️ 2-Step Verification is NOT enabled. Enabling it now...")
+                            enable_success, error_code, error_msg = enable_two_step_verification(driver, email)
+                            if enable_success:
+                                logger.info("[STEP] ✓ 2-Step Verification enabled. Waiting 5 seconds before retry...")
+                                time.sleep(5)
+                            else:
+                                logger.error(f"[STEP] ✗ Failed to enable 2-Step Verification: {error_code} - {error_msg}")
+                                return False, None, error_code or "2SV_ENABLE_FAILED", error_msg or "Failed to enable 2-Step Verification"
+                    except Exception as check_err:
+                        logger.error(f"[STEP] Error checking 2-step verification: {check_err}")
+                        logger.error(traceback.format_exc())
+                else:
+                    # Final attempt - check 2SV and retry once more
+                    logger.warning("[STEP] Final timeout. Checking 2-step verification status...")
+                    try:
+                        driver.get("https://myaccount.google.com/signinoptions/twosv?hl=en")
+                        time.sleep(3)
+                        
+                        if detect_captcha(driver):
+                            logger.warning("[STEP] ⚠️ CAPTCHA detected on 2SV page!")
+                            solved, solve_error = solve_captcha_with_2captcha(driver)
+                            if solved:
+                                logger.info("[STEP] ✓✓✓ CAPTCHA solved! Continuing...")
+                                time.sleep(3)
+                                driver.refresh()
+                                time.sleep(2)
+                        
+                        if element_exists(driver, "//button[contains(., 'Turn off')]", timeout=5):
+                            logger.info("[STEP] ✓ 2-Step Verification is enabled.")
+                        else:
+                            logger.warning("[STEP] ⚠️ 2-Step Verification is NOT enabled. Enabling it now...")
+                            enable_success, error_code, error_msg = enable_two_step_verification(driver, email)
+                            if enable_success:
+                                logger.info("[STEP] ✓ 2-Step Verification enabled. Final retry...")
+                                time.sleep(5)
+                                try:
+                                    driver.get("https://myaccount.google.com/apppasswords?hl=en")
+                                    WebDriverWait(driver, 15).until(
+                                        lambda d: d.execute_script("return document.readyState") == "complete"
+                                    )
+                                    time.sleep(2)
+                                    app_password_page_loaded = True
+                                except TimeoutException:
+                                    return False, None, "APP_PASSWORD_PAGE_TIMEOUT", "App password page failed to load even after enabling 2-Step Verification"
+                            else:
+                                return False, None, error_code or "2SV_ENABLE_FAILED", error_msg or "Failed to enable 2-Step Verification"
+                    except Exception as final_err:
+                        logger.error(f"[STEP] Error in final 2SV check: {final_err}")
+                        logger.error(traceback.format_exc())
+                        return False, None, "APP_PASSWORD_PAGE_TIMEOUT", f"App password page timeout and 2SV check failed: {final_err}"
+        
+        if not app_password_page_loaded:
+            logger.error("[STEP] Failed to load app password page after all retries and 2SV checks")
+            return False, None, "APP_PASSWORD_PAGE_TIMEOUT", "App password page failed to load after multiple attempts"
         
         # Add human-like behavior after page load
         add_random_delays()
@@ -2884,16 +3059,6 @@ def generate_app_password(driver, email):
             else:
                 logger.error(f"[STEP] ✗✗✗ CAPTCHA solving failed: {solve_error}")
                 return False, None, "CAPTCHA_DETECTED", f"CAPTCHA detected on app passwords page. 2Captcha solving failed: {solve_error}"
-        
-        # Wait for page to be ready
-        try:
-            WebDriverWait(driver, 10).until(
-                lambda d: d.execute_script("return document.readyState") == "complete"
-            )
-            time.sleep(2)  # Additional wait for dynamic content
-            logger.info("[STEP] App passwords page loaded")
-        except TimeoutException:
-            logger.warning("[STEP] App passwords page load timeout, proceeding anyway...")
         
         max_retries = 3
         initial_timeout = 30
