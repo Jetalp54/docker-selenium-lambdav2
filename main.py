@@ -30,7 +30,6 @@ import boto3
 from botocore.exceptions import ClientError
 import paramiko
 import pyotp
-from fake_useragent import UserAgent
 
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -115,82 +114,6 @@ _proxy_list_cache = None
 _proxy_rotation_counter = 0
 _proxy_lock = threading.Lock()
 
-# Global UserAgent instance (cached for performance)
-_user_agent_cache = None
-_ua_lock = threading.Lock()
-
-def get_user_agent():
-    """Get a random realistic User-Agent using fake_useragent library
-    
-    Uses fake_useragent to generate realistic, up-to-date User-Agents.
-    Falls back to hardcoded list if fake_useragent fails (e.g., offline in Lambda).
-    """
-    global _user_agent_cache
-    
-    with _ua_lock:
-        if _user_agent_cache is None:
-            try:
-                # Try to create UserAgent instance
-                # In Lambda, we use cache=True to use cached database (if available)
-                # If cache doesn't exist, it will download once and cache it
-                # Use verify_ssl=False for Lambda environments that may have SSL issues
-                try:
-                    _user_agent_cache = UserAgent(
-                        cache=True,  # Use cache to avoid re-downloading
-                        verify_ssl=False,  # Lambda may have SSL certificate issues
-                        fallback='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
-                    )
-                    # Test if it works by getting one UA
-                    _user_agent_cache.random
-                    logger.info("[USER-AGENT] ✓ fake_useragent initialized successfully")
-                except Exception as init_err:
-                    logger.warning(f"[USER-AGENT] Initial UserAgent creation failed: {init_err}")
-                    # Try with cache=False as fallback
-                    try:
-                        _user_agent_cache = UserAgent(cache=False, verify_ssl=False)
-                        _user_agent_cache.random
-                        logger.info("[USER-AGENT] ✓ fake_useragent initialized with cache=False")
-                    except Exception as fallback_err:
-                        logger.warning(f"[USER-AGENT] Both initialization methods failed: {fallback_err}")
-                        _user_agent_cache = None
-            except Exception as e:
-                logger.warning(f"[USER-AGENT] Failed to initialize fake_useragent: {e}, using fallback")
-                # Fallback to hardcoded list if fake_useragent fails
-                _user_agent_cache = None
-        
-        # Get random User-Agent
-        try:
-            if _user_agent_cache:
-                # Try to get Chrome-specific User-Agent for better compatibility
-                try:
-                    ua = _user_agent_cache.chrome  # Get Chrome-specific UA
-                except:
-                    ua = _user_agent_cache.random  # Fallback to random
-                
-                # Validate UA is reasonable (should contain Mozilla and Chrome)
-                if ua and 'Mozilla' in ua and ('Chrome' in ua or 'chromium' in ua.lower()):
-                    logger.debug(f"[USER-AGENT] Generated User-Agent: {ua[:60]}...")
-                    return ua
-                else:
-                    logger.warning(f"[USER-AGENT] Invalid UA generated: {ua[:60]}..., using fallback")
-                    raise ValueError("Invalid User-Agent generated")
-            else:
-                # Fallback to hardcoded list if fake_useragent not available
-                fallback_agents = [
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
-                    "Mozilla/5.0 (Windows NT 11.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36",
-                ]
-                selected = random.choice(fallback_agents)
-                logger.debug(f"[USER-AGENT] Using fallback User-Agent: {selected[:60]}...")
-                return selected
-        except Exception as e:
-            logger.warning(f"[USER-AGENT] Error getting User-Agent: {e}, using fallback")
-            return "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-
 def get_proxy_list_from_env():
     """Get and parse proxy list from environment variable"""
     global _proxy_list_cache
@@ -263,6 +186,32 @@ def get_proxy_from_env():
     except Exception as e:
         logger.warning(f"[PROXY] Error formatting proxy config: {e}")
         return None
+
+# =====================================================================
+# Anti-Detection Constants
+# =====================================================================
+
+# Modern User-Agents for rotation
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/121.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:109.0) Gecko/20100101 Firefox/121.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15"
+]
+
+# Common Window Sizes for rotation
+WINDOW_SIZES = [
+    "1920,1080",
+    "1366,768",
+    "1440,900",
+    "1536,864",
+    "1280,800",
+    "1280,720"
+]
 
 def get_chrome_driver():
     """
@@ -357,12 +306,21 @@ def get_chrome_driver():
         logger.info(f"[PROXY] Using proxy: {proxy_config['ip']}:{proxy_config['port']}")
         chrome_options.add_argument(f"--proxy-server={proxy_config['http']}")
     
+    # Randomize User-Agent
+    user_agent = random.choice(USER_AGENTS)
+    chrome_options.add_argument(f"--user-agent={user_agent}")
+    logger.info(f"[ANTI-DETECT] Using User-Agent: {user_agent}")
+
+    # Randomize Window Size
+    window_size = random.choice(WINDOW_SIZES)
+    chrome_options.add_argument(f"--window-size={window_size}")
+    logger.info(f"[ANTI-DETECT] Using Window Size: {window_size}")
+    
     # Core stability options for Lambda
     chrome_options.add_argument("--headless=new")
     chrome_options.add_argument("--no-sandbox")
     chrome_options.add_argument("--disable-dev-shm-usage")
     chrome_options.add_argument("--disable-gpu")
-    chrome_options.add_argument("--window-size=1280,800")
     chrome_options.add_argument("--lang=en-US")
     
     # Additional stability options for Lambda environment
@@ -378,37 +336,16 @@ def get_chrome_driver():
     chrome_options.add_argument("--disable-setuid-sandbox")
     chrome_options.add_argument("--disable-software-rasterizer")
     
-    # ADVANCED Anti-detection options (Lambda-compatible)
-    # These are critical for avoiding bot detection
+    # Anti-detection options (Lambda-compatible)
     chrome_options.add_argument("--disable-blink-features=AutomationControlled")
-    chrome_options.add_argument("--disable-features=IsolateOrigins,site-per-process")
-    chrome_options.add_argument("--disable-site-isolation-trials")
-    chrome_options.add_argument("--disable-web-security")  # Helps with some detection bypasses
-    chrome_options.add_argument("--disable-features=VizDisplayCompositor")
-    
-    # Exclude automation switches (CRITICAL for stealth)
-    chrome_options.add_experimental_option("excludeSwitches", [
-        "enable-automation",
-        "enable-logging",
-        "enable-blink-features=AutomationControlled"
-    ])
-    
-    # Disable automation extension
+    chrome_options.add_experimental_option("excludeSwitches", ["enable-automation", "enable-logging"])
     chrome_options.add_experimental_option('useAutomationExtension', False)
-    
-    # Set preferences to mimic real user
     chrome_options.add_experimental_option("prefs", {
         "profile.default_content_setting_values.notifications": 2,
         "profile.default_content_settings.popups": 0,
-        "profile.managed_default_content_settings.images": 1,  # Allow images
         "credentials_enable_service": False,
-        "password_manager_enabled": False,
+        "profile.password_manager_enabled": False,
     })
-    
-    # Add random but realistic User-Agent using fake_useragent
-    selected_ua = get_user_agent()
-    chrome_options.add_argument(f"--user-agent={selected_ua}")
-    logger.info(f"[LAMBDA] Using User-Agent: {selected_ua[:60]}...")
 
     try:
         # Create Service with explicit ChromeDriver path
@@ -434,322 +371,125 @@ def get_chrome_driver():
         # Wait for Chrome to fully initialize
         time.sleep(2)
         
-        # Inject ADVANCED anti-detection scripts (stealth.min.js inspired approach)
-        # This is the MOST comprehensive anti-detection available for Lambda environment
+        # Inject comprehensive anti-detection scripts AFTER driver is stable
+        # Do this BEFORE any navigation to ensure it's applied to all pages
         try:
-            # Generate random but realistic browser fingerprint
-            # This makes each session unique and harder to detect
-            random_seed = random.randint(1000, 9999)
-            
-            # Get realistic User-Agent using fake_useragent (more variety than hardcoded list)
-            selected_ua = get_user_agent()
-            
-            # Generate random hardware specs (realistic values)
-            hardware_cores = random.choice([4, 8, 12, 16])
-            device_memory = random.choice([4, 8, 16])
-            
-            # Advanced stealth script (based on stealth.min.js principles)
-            advanced_stealth_script = f'''
-            (function() {{
-                // ===== CORE WEBDRIVER DETECTION REMOVAL =====
-                // Remove webdriver property completely
-                Object.defineProperty(navigator, 'webdriver', {{
-                    get: () => undefined,
+            # Enhanced anti-detection script with multiple techniques
+            anti_detection_script = '''
+                // 1. Hide webdriver property
+                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+                
+                // 2. Spoof plugins
+                Object.defineProperty(navigator, 'plugins', {
+                    get: () => [1, 2, 3, 4, 5],
                     configurable: true
-                }});
+                });
                 
-                // Remove automation indicators
-                delete window.cdc_adoQpoasnfa76pfcZLmcfl_Array;
-                delete window.cdc_adoQpoasnfa76pfcZLmcfl_Promise;
-                delete window.cdc_adoQpoasnfa76pfcZLmcfl_Symbol;
-                
-                // ===== NAVIGATOR PROPERTIES SPOOFING =====
-                // Realistic plugins array
-                Object.defineProperty(navigator, 'plugins', {{
-                    get: () => {{
-                        const plugins = [
-                            {{ name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer', description: 'Portable Document Format' }},
-                            {{ name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai', description: '' }},
-                            {{ name: 'Native Client', filename: 'internal-nacl-plugin', description: '' }}
-                        ];
-                        return plugins;
-                    }},
-                    configurable: true
-                }});
-                
-                // Realistic languages
-                Object.defineProperty(navigator, 'languages', {{
+                // 3. Spoof languages
+                Object.defineProperty(navigator, 'languages', {
                     get: () => ['en-US', 'en'],
                     configurable: true
-                }});
+                });
                 
-                // Platform spoofing
-                Object.defineProperty(navigator, 'platform', {{
+                // 4. Spoof platform
+                Object.defineProperty(navigator, 'platform', {
                     get: () => 'Win32',
                     configurable: true
-                }});
+                });
                 
-                // Hardware concurrency (realistic CPU cores)
-                Object.defineProperty(navigator, 'hardwareConcurrency', {{
-                    get: () => {hardware_cores},
-                    configurable: true
-                }});
+                // 5. Add chrome runtime
+                window.chrome = {runtime: {}};
                 
-                // Device memory (realistic RAM)
-                Object.defineProperty(navigator, 'deviceMemory', {{
-                    get: () => {device_memory},
-                    configurable: true
-                }});
-                
-                // ===== CHROME RUNTIME SPOOFING =====
-                window.chrome = {{
-                    runtime: {{}},
-                    loadTimes: function() {{}},
-                    csi: function() {{}},
-                    app: {{}}
-                }};
-                
-                // ===== PERMISSIONS API OVERRIDE =====
+                // 6. Spoof permissions
                 const originalQuery = window.navigator.permissions.query;
-                window.navigator.permissions.query = function(parameters) {{
-                    return parameters.name === 'notifications' ?
-                        Promise.resolve({{ state: Notification.permission }}) :
-                        originalQuery(parameters);
-                }};
+                window.navigator.permissions.query = (parameters) => (
+                    parameters.name === 'notifications' ?
+                        Promise.resolve({ state: Notification.permission }) :
+                        originalQuery(parameters)
+                );
                 
-                // ===== WEBGL FINGERPRINT SPOOFING =====
+                // 7. Spoof WebGL vendor and renderer (Intel)
                 const getParameter = WebGLRenderingContext.prototype.getParameter;
-                WebGLRenderingContext.prototype.getParameter = function(parameter) {{
-                    if (parameter === 37445) {{
+                WebGLRenderingContext.prototype.getParameter = function(parameter) {
+                    if (parameter === 37445) {
                         return 'Intel Inc.';
-                    }}
-                    if (parameter === 37446) {{
+                    }
+                    if (parameter === 37446) {
                         return 'Intel Iris OpenGL Engine';
-                    }}
-                    if (parameter === 7936) {{
-                        return 'WebGL 1.0';
-                    }}
-                    if (parameter === 7937) {{
-                        return 'WebGL GLSL ES 1.0';
-                    }}
-                    if (parameter === 7938) {{
-                        return 'WebGL GLSL ES 1.0';
-                    }}
+                    }
                     return getParameter.call(this, parameter);
-                }};
+                };
                 
-                // WebGL2 context spoofing
-                if (window.WebGL2RenderingContext) {{
-                    const getParameter2 = WebGL2RenderingContext.prototype.getParameter;
-                    WebGL2RenderingContext.prototype.getParameter = function(parameter) {{
-                        if (parameter === 37445) {{
-                            return 'Intel Inc.';
-                        }}
-                        if (parameter === 37446) {{
-                            return 'Intel Iris OpenGL Engine';
-                        }}
-                        return getParameter2.call(this, parameter);
-                    }};
-                }}
-                
-                // ===== CANVAS FINGERPRINT RANDOMIZATION =====
+                // 8. Randomize canvas fingerprinting (Canvas Noise)
                 const originalToDataURL = HTMLCanvasElement.prototype.toDataURL;
-                const originalGetImageData = CanvasRenderingContext2D.prototype.getImageData;
-                
-                HTMLCanvasElement.prototype.toDataURL = function() {{
+                HTMLCanvasElement.prototype.toDataURL = function() {
                     const context = this.getContext('2d');
-                    if (context) {{
+                    if (context) {
                         const imageData = context.getImageData(0, 0, this.width, this.height);
-                        // Add subtle noise to prevent fingerprinting
-                        for (let i = 0; i < imageData.data.length; i += 4) {{
+                        for (let i = 0; i < imageData.data.length; i += 4) {
                             imageData.data[i] += Math.floor(Math.random() * 3) - 1;
-                            imageData.data[i + 1] += Math.floor(Math.random() * 3) - 1;
-                            imageData.data[i + 2] += Math.floor(Math.random() * 3) - 1;
-                        }}
+                        }
                         context.putImageData(imageData, 0, 0);
-                    }}
+                    }
                     return originalToDataURL.apply(this, arguments);
-                }};
+                };
                 
-                CanvasRenderingContext2D.prototype.getImageData = function() {{
-                    const imageData = originalGetImageData.apply(this, arguments);
-                    // Add noise to prevent fingerprinting
-                    for (let i = 0; i < imageData.data.length; i += 4) {{
-                        imageData.data[i] += Math.floor(Math.random() * 3) - 1;
-                    }}
-                    return imageData;
-                }};
+                // 9. Spoof mediaDevices (enumerateDevices)
+                if (navigator.mediaDevices && navigator.mediaDevices.enumerateDevices) {
+                    const originalEnumerateDevices = navigator.mediaDevices.enumerateDevices;
+                    navigator.mediaDevices.enumerateDevices = function() {
+                        return Promise.resolve([
+                            {
+                                deviceId: "default",
+                                kind: "audioinput",
+                                label: "Default Audio Input",
+                                groupId: "group1"
+                            },
+                            {
+                                deviceId: "default",
+                                kind: "videoinput",
+                                label: "Default Video Input",
+                                groupId: "group1"
+                            },
+                            {
+                                deviceId: "default",
+                                kind: "audiooutput",
+                                label: "Default Audio Output",
+                                groupId: "group1"
+                            }
+                        ]);
+                    };
+                }
                 
-                // ===== AUDIO CONTEXT FINGERPRINT SPOOFING =====
-                if (window.AudioContext || window.webkitAudioContext) {{
-                    const AudioContext = window.AudioContext || window.webkitAudioContext;
-                    const originalCreateAnalyser = AudioContext.prototype.createAnalyser;
-                    AudioContext.prototype.createAnalyser = function() {{
-                        const analyser = originalCreateAnalyser.apply(this, arguments);
-                        const originalGetFloatFrequencyData = analyser.getFloatFrequencyData;
-                        analyser.getFloatFrequencyData = function(array) {{
-                            originalGetFloatFrequencyData.apply(this, arguments);
-                            // Add noise to prevent audio fingerprinting
-                            for (let i = 0; i < array.length; i++) {{
-                                array[i] += (Math.random() - 0.5) * 0.0001;
-                            }}
-                        }};
-                        return analyser;
-                    }};
-                }}
+                // 10. Spoof Hardware Concurrency and Device Memory
+                Object.defineProperty(navigator, 'hardwareConcurrency', {get: () => 8});
+                Object.defineProperty(navigator, 'deviceMemory', {get: () => 8});
                 
-                // ===== BATTERY API SPOOFING =====
-                if (navigator.getBattery) {{
-                    const originalGetBattery = navigator.getBattery;
-                    navigator.getBattery = function() {{
-                        return Promise.resolve({{
-                            charging: true,
-                            chargingTime: 0,
-                            dischargingTime: Infinity,
-                            level: 1.0
-                        }});
-                    }};
-                }}
-                
-                // ===== WEBRTC IP LEAK PREVENTION =====
-                const RTCPeerConnection = window.RTCPeerConnection || window.mozRTCPeerConnection || window.webkitRTCPeerConnection;
-                if (RTCPeerConnection) {{
-                    const originalCreateOffer = RTCPeerConnection.prototype.createOffer;
-                    RTCPeerConnection.prototype.createOffer = function() {{
-                        return originalCreateOffer.apply(this, arguments).then(offer => {{
-                            // Remove IP addresses from SDP
-                            offer.sdp = offer.sdp.replace(/\\r\\na=candidate.*\\r\\n/g, '');
-                            return offer;
-                        }});
-                    }};
-                }}
-                
-                // ===== MOUSE AND KEYBOARD EVENT SPOOFING =====
-                // Add realistic mouse movement tracking
-                let mouseEvents = [];
-                document.addEventListener('mousemove', function(e) {{
-                    mouseEvents.push({{ x: e.clientX, y: e.clientY, time: Date.now() }});
-                    if (mouseEvents.length > 100) mouseEvents.shift();
-                }}, true);
-                
-                // ===== CONSOLE OVERRIDE =====
-                // Prevent console detection
-                const originalLog = console.log;
-                console.log = function() {{
-                    // Silently log or modify output
-                    originalLog.apply(console, arguments);
-                }};
-                
-                // ===== TIMING ATTACK PREVENTION =====
-                // Randomize performance timing slightly
-                if (window.performance && window.performance.now) {{
-                    const originalNow = window.performance.now;
-                    window.performance.now = function() {{
-                        return originalNow.apply(this, arguments) + Math.random() * 0.1;
-                    }};
-                }}
-                
-                // ===== PLUGIN LENGTH SPOOFING =====
-                Object.defineProperty(navigator, 'pluginLength', {{
-                    get: () => 3,
-                    configurable: true
-                }});
-                
-                // ===== CONNECTION API SPOOFING =====
-                if (navigator.connection) {{
-                    Object.defineProperty(navigator, 'connection', {{
-                        get: () => ({{
-                            effectiveType: '4g',
-                            rtt: 50,
-                            downlink: 10,
-                            saveData: false
-                        }}),
-                        configurable: true
-                    }});
-                }}
-                
-                // ===== USER AGENT OVERRIDE =====
-                Object.defineProperty(navigator, 'userAgent', {{
-                    get: () => '{selected_ua}',
-                    configurable: true
-                }});
-                
-                // ===== VENDOR SPOOFING =====
-                Object.defineProperty(navigator, 'vendor', {{
-                    get: () => 'Google Inc.',
-                    configurable: true
-                }});
-                
-                // ===== MAX TOUCH POINTS =====
-                Object.defineProperty(navigator, 'maxTouchPoints', {{
-                    get: () => 0,
-                    configurable: true
-                }});
-                
-                // ===== NOTIFICATION PERMISSION =====
-                if (window.Notification) {{
-                    Object.defineProperty(Notification, 'permission', {{
-                        get: () => 'default',
-                        configurable: true
-                    }});
-                }}
-                
-                // ===== DOCUMENT PROPERTIES =====
-                Object.defineProperty(document, 'hidden', {{
-                    get: () => false,
-                    configurable: true
-                }});
-                
-                Object.defineProperty(document, 'visibilityState', {{
-                    get: () => 'visible',
-                    configurable: true
-                }});
-                
-                // ===== PREVENT AUTOMATION DETECTION =====
-                // Remove automation flags
-                Object.defineProperty(navigator, 'webdriver', {{
-                    get: () => false,
-                    configurable: true
-                }});
-                
-                // Override automation detection
-                window.navigator.webdriver = false;
-                delete window.navigator.__proto__.webdriver;
-                
-                // ===== FINAL CLEANUP =====
-                // Ensure all properties are properly set
-                if (!window.chrome) {{
-                    window.chrome = {{ runtime: {{}} }};
-                }}
-                
-                // Prevent detection via toString
-                const originalToString = Function.prototype.toString;
-                Function.prototype.toString = function() {{
-                    if (this === navigator.getBattery || this === navigator.connection) {{
-                        return 'function ' + this.name + '() {{ [native code] }}';
-                    }}
-                    return originalToString.apply(this, arguments);
-                }};
-            }})();
-            '''.format(hardware_cores=hardware_cores, device_memory=device_memory, selected_ua=selected_ua)
+                // 11. Add realistic mouse movement simulation
+                let mouseMoveCount = 0;
+                document.addEventListener('DOMContentLoaded', function() {
+                    setInterval(function() {
+                        if (mouseMoveCount < 10) {
+                            const event = new MouseEvent('mousemove', {
+                                view: window,
+                                bubbles: true,
+                                cancelable: true,
+                                clientX: Math.random() * window.innerWidth,
+                                clientY: Math.random() * window.innerHeight
+                            });
+                            document.dispatchEvent(event);
+                            mouseMoveCount++;
+                        }
+                    }, 2000 + Math.random() * 3000);
+                });
+            '''
             
-            # Inject the advanced stealth script
             driver.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument', {
-                'source': advanced_stealth_script
+                'source': anti_detection_script
             })
-            
-            # Also set User-Agent via CDP for better compatibility
-            driver.execute_cdp_cmd('Network.setUserAgentOverride', {
-                'userAgent': selected_ua
-            })
-            
-            # Enable domain to allow CDP commands
-            driver.execute_cdp_cmd('Network.enable', {})
-            driver.execute_cdp_cmd('Page.enable', {})
-            
-            logger.info(f"[LAMBDA] ✓✓✓ ADVANCED stealth script injected successfully (UA: {selected_ua[:50]}...)")
+            logger.info("[LAMBDA] Enhanced anti-detection script injected successfully")
         except Exception as e:
-            logger.warning(f"[LAMBDA] Could not inject advanced stealth script (non-critical): {e}")
+            logger.warning(f"[LAMBDA] Could not inject anti-detection script (non-critical): {e}")
             # Continue anyway - this is not critical, but log it
         
         logger.info("[LAMBDA] Chrome driver created successfully")
@@ -1012,13 +752,6 @@ def solve_recaptcha_v2(driver, api_key, site_key=None, page_url=None):
                 if submit_result.get('status') != 1:
                     error_msg = submit_result.get('request', 'Unknown error')
                     logger.error(f"[2CAPTCHA] Failed to submit CAPTCHA: {error_msg}")
-                    
-                    # Check for specific error codes that indicate API key issues
-                    if 'ERROR_ZERO_CAPTCHA_FILESIZE' in error_msg or 'ERROR_WRONG_USER_KEY' in error_msg or 'ERROR_KEY_DOES_NOT_EXIST' in error_msg:
-                        logger.error(f"[2CAPTCHA] ⚠️ API Key Error: {error_msg}")
-                        logger.error(f"[2CAPTCHA] Please verify your 2Captcha API key is correct and has balance")
-                        return False, None, f"Invalid API key or no balance: {error_msg}"
-                    
                     return False, None, f"2Captcha submission failed: {error_msg}"
                 
                 task_id = submit_result.get('request')
@@ -1062,13 +795,6 @@ def solve_recaptcha_v2(driver, api_key, site_key=None, page_url=None):
                     else:
                         error_msg = get_result.get('request', 'Unknown error')
                         logger.error(f"[2CAPTCHA] Error getting solution: {error_msg}")
-                        
-                        # Check for specific error codes that indicate API key issues
-                        if 'ERROR_ZERO_CAPTCHA_FILESIZE' in error_msg or 'ERROR_WRONG_USER_KEY' in error_msg or 'ERROR_KEY_DOES_NOT_EXIST' in error_msg:
-                            logger.error(f"[2CAPTCHA] ⚠️ API Key Error: {error_msg}")
-                            logger.error(f"[2CAPTCHA] Please verify your 2Captcha API key is correct and has balance")
-                            return False, None, f"Invalid API key or no balance: {error_msg}"
-                        
                         return False, None, f"2Captcha solution error: {error_msg}"
             except Exception as e:
                 logger.warning(f"[2CAPTCHA] Error polling for solution: {e}")
@@ -1097,7 +823,8 @@ def inject_recaptcha_token(driver, token):
         var scripts = document.getElementsByTagName('script');
         for (var i = 0; i < scripts.length; i++) {{
             var scriptText = scripts[i].innerHTML;
-            var match = scriptText.match(/grecaptcha\.execute\([^,]+,\s*{{[^}}]*callback:\s*['"]([^'"]+)['"]/);
+            // Fixed invalid escape sequences by double escaping backslashes
+            var match = scriptText.match(/grecaptcha\\.execute\\([^,]+,\\s*{{[^}}]*callback:\\s*['"]([^'"]+)['"]/);
             if (match) {{
                 callbackName = match[1];
                 break;
@@ -1768,9 +1495,9 @@ def login_google(driver, email, password, known_totp_secret=None):
         
         if not password_input:
             # Fallback: Try XPath methods (fixed invalid XPath syntax)
-        password_input_xpaths = [
-            "//input[@name='Passwd']",
-            "//input[@type='password']",
+            password_input_xpaths = [
+                "//input[@name='Passwd']",
+                "//input[@type='password']",
                 "/html/body/div[2]/div[1]/div[1]/div[2]/c-wiz/main/div[2]/div/div/div/form/span/section[2]/div/div/div[1]/div[1]/div/div/div/div/div[1]/div/div[1]/input",  # User-provided working XPath
                 "//input[@id='password']",
                 "//input[@name='password']",
@@ -2081,7 +1808,7 @@ def login_google(driver, email, password, known_totp_secret=None):
             
             # Try standard clear first
             try:
-        password_input.clear()
+                password_input.clear()
             except:
                 # If clear fails, use JavaScript
                 driver.execute_script("arguments[0].value = '';", password_input)
@@ -2875,182 +2602,7 @@ def generate_app_password(driver, email):
         logger.info("[STEP] Waiting for app password page to be ready (may take up to 30 seconds after enabling 2SV)...")
         
         # Navigate to app passwords page with hl=en for English
-        # Add timeout handling - if page doesn't load, check 2-step verification status
-        app_password_page_loaded = False
-        max_page_load_retries = 2
-        
-        for page_load_attempt in range(max_page_load_retries):
-            try:
-                logger.info(f"[STEP] Attempting to load app password page (attempt {page_load_attempt + 1}/{max_page_load_retries})...")
         driver.get("https://myaccount.google.com/apppasswords?hl=en")
-        
-                # Wait for page to be ready with timeout
-        try:
-                    WebDriverWait(driver, 15).until(
-                lambda d: d.execute_script("return document.readyState") == "complete"
-            )
-            time.sleep(2)  # Additional wait for dynamic content
-                    logger.info("[STEP] App passwords page loaded successfully")
-                    app_password_page_loaded = True
-                    break
-        except TimeoutException:
-                    logger.warning(f"[STEP] App passwords page load timeout on attempt {page_load_attempt + 1}")
-                    if page_load_attempt < max_page_load_retries - 1:
-                        # Check 2-step verification status before retrying
-                        logger.info("[STEP] Checking 2-step verification status before retry...")
-                        try:
-                            # Navigate to 2-step verification page
-                            driver.get("https://myaccount.google.com/signinoptions/twosv?hl=en")
-                            time.sleep(3)
-                            
-                            # Check for captcha on 2SV page
-                            if detect_captcha(driver):
-                                logger.warning("[STEP] ⚠️ CAPTCHA detected on 2SV page during check!")
-                                solved, solve_error = solve_captcha_with_2captcha(driver)
-                                if solved:
-                                    logger.info("[STEP] ✓✓✓ CAPTCHA solved! Continuing...")
-                                    time.sleep(3)
-                                    driver.refresh()
-                                    time.sleep(2)
-                                else:
-                                    logger.error(f"[STEP] ✗✗✗ CAPTCHA solving failed: {solve_error}")
-                            
-                            # Check if 2-step verification is enabled
-                            if element_exists(driver, "//button[contains(., 'Turn off')]", timeout=5):
-                                logger.info("[STEP] ✓ 2-Step Verification is already enabled. Retrying app password page...")
-                            else:
-                                logger.warning("[STEP] ⚠️ 2-Step Verification is NOT enabled. Enabling it now...")
-                                # Enable 2-step verification
-                                enable_success, error_code, error_msg = enable_two_step_verification(driver, email)
-                                if enable_success:
-                                    logger.info("[STEP] ✓ 2-Step Verification enabled successfully. Waiting 5 seconds before retrying app password page...")
-                                    time.sleep(5)  # Wait for changes to propagate
-                                else:
-                                    logger.error(f"[STEP] ✗ Failed to enable 2-Step Verification: {error_code} - {error_msg}")
-                                    return False, None, error_code or "2SV_ENABLE_FAILED", error_msg or "Failed to enable 2-Step Verification"
-                        except Exception as check_err:
-                            logger.error(f"[STEP] Error checking 2-step verification status: {check_err}")
-                            logger.error(traceback.format_exc())
-                    else:
-                        # Last attempt failed, proceed to check 2SV status anyway
-                        logger.warning("[STEP] All page load attempts failed. Checking 2-step verification status...")
-                        try:
-                            driver.get("https://myaccount.google.com/signinoptions/twosv?hl=en")
-                            time.sleep(3)
-                            
-                            # Check for captcha
-                            if detect_captcha(driver):
-                                logger.warning("[STEP] ⚠️ CAPTCHA detected on 2SV page!")
-                                solved, solve_error = solve_captcha_with_2captcha(driver)
-                                if solved:
-                                    logger.info("[STEP] ✓✓✓ CAPTCHA solved! Continuing...")
-                                    time.sleep(3)
-                                    driver.refresh()
-                                    time.sleep(2)
-                            
-                            # Check if 2-step verification is enabled
-                            if element_exists(driver, "//button[contains(., 'Turn off')]", timeout=5):
-                                logger.info("[STEP] ✓ 2-Step Verification is enabled. App password page may require manual intervention.")
-                            else:
-                                logger.warning("[STEP] ⚠️ 2-Step Verification is NOT enabled. Enabling it now...")
-                                enable_success, error_code, error_msg = enable_two_step_verification(driver, email)
-                                if enable_success:
-                                    logger.info("[STEP] ✓ 2-Step Verification enabled. Waiting 5 seconds before final retry...")
-                                    time.sleep(5)
-                                    # Final retry
-                                    try:
-                                        driver.get("https://myaccount.google.com/apppasswords?hl=en")
-                                        WebDriverWait(driver, 15).until(
-                                            lambda d: d.execute_script("return document.readyState") == "complete"
-                                        )
-                                        time.sleep(2)
-                                        logger.info("[STEP] App passwords page loaded after 2SV enable")
-                                        app_password_page_loaded = True
-                                    except TimeoutException:
-                                        logger.error("[STEP] App password page still not loading after enabling 2SV")
-                                        return False, None, "APP_PASSWORD_PAGE_TIMEOUT", "App password page failed to load even after enabling 2-Step Verification"
-                                else:
-                                    return False, None, error_code or "2SV_ENABLE_FAILED", error_msg or "Failed to enable 2-Step Verification"
-                        except Exception as final_check_err:
-                            logger.error(f"[STEP] Error in final 2SV check: {final_check_err}")
-                            logger.error(traceback.format_exc())
-            except TimeoutException as page_timeout:
-                logger.error(f"[STEP] Timeout loading app password page: {page_timeout}")
-                if page_load_attempt < max_page_load_retries - 1:
-                    # Check 2-step verification before retrying
-                    logger.info("[STEP] Checking 2-step verification status before retry...")
-                    try:
-                        driver.get("https://myaccount.google.com/signinoptions/twosv?hl=en")
-                        time.sleep(3)
-                        
-                        # Check for captcha
-                        if detect_captcha(driver):
-                            logger.warning("[STEP] ⚠️ CAPTCHA detected on 2SV page!")
-                            solved, solve_error = solve_captcha_with_2captcha(driver)
-                            if solved:
-                                logger.info("[STEP] ✓✓✓ CAPTCHA solved! Continuing...")
-                                time.sleep(3)
-                                driver.refresh()
-                                time.sleep(2)
-                        
-                        # Check if 2-step verification is enabled
-                        if element_exists(driver, "//button[contains(., 'Turn off')]", timeout=5):
-                            logger.info("[STEP] ✓ 2-Step Verification is already enabled. Retrying app password page...")
-                        else:
-                            logger.warning("[STEP] ⚠️ 2-Step Verification is NOT enabled. Enabling it now...")
-                            enable_success, error_code, error_msg = enable_two_step_verification(driver, email)
-                            if enable_success:
-                                logger.info("[STEP] ✓ 2-Step Verification enabled. Waiting 5 seconds before retry...")
-                                time.sleep(5)
-                            else:
-                                logger.error(f"[STEP] ✗ Failed to enable 2-Step Verification: {error_code} - {error_msg}")
-                                return False, None, error_code or "2SV_ENABLE_FAILED", error_msg or "Failed to enable 2-Step Verification"
-                    except Exception as check_err:
-                        logger.error(f"[STEP] Error checking 2-step verification: {check_err}")
-                        logger.error(traceback.format_exc())
-                else:
-                    # Final attempt - check 2SV and retry once more
-                    logger.warning("[STEP] Final timeout. Checking 2-step verification status...")
-                    try:
-                        driver.get("https://myaccount.google.com/signinoptions/twosv?hl=en")
-                        time.sleep(3)
-                        
-                        if detect_captcha(driver):
-                            logger.warning("[STEP] ⚠️ CAPTCHA detected on 2SV page!")
-                            solved, solve_error = solve_captcha_with_2captcha(driver)
-                            if solved:
-                                logger.info("[STEP] ✓✓✓ CAPTCHA solved! Continuing...")
-                                time.sleep(3)
-                                driver.refresh()
-                                time.sleep(2)
-                        
-                        if element_exists(driver, "//button[contains(., 'Turn off')]", timeout=5):
-                            logger.info("[STEP] ✓ 2-Step Verification is enabled.")
-                        else:
-                            logger.warning("[STEP] ⚠️ 2-Step Verification is NOT enabled. Enabling it now...")
-                            enable_success, error_code, error_msg = enable_two_step_verification(driver, email)
-                            if enable_success:
-                                logger.info("[STEP] ✓ 2-Step Verification enabled. Final retry...")
-                                time.sleep(5)
-                                try:
-                                    driver.get("https://myaccount.google.com/apppasswords?hl=en")
-                                    WebDriverWait(driver, 15).until(
-                                        lambda d: d.execute_script("return document.readyState") == "complete"
-                                    )
-                                    time.sleep(2)
-                                    app_password_page_loaded = True
-                                except TimeoutException:
-                                    return False, None, "APP_PASSWORD_PAGE_TIMEOUT", "App password page failed to load even after enabling 2-Step Verification"
-                            else:
-                                return False, None, error_code or "2SV_ENABLE_FAILED", error_msg or "Failed to enable 2-Step Verification"
-                    except Exception as final_err:
-                        logger.error(f"[STEP] Error in final 2SV check: {final_err}")
-                        logger.error(traceback.format_exc())
-                        return False, None, "APP_PASSWORD_PAGE_TIMEOUT", f"App password page timeout and 2SV check failed: {final_err}"
-        
-        if not app_password_page_loaded:
-            logger.error("[STEP] Failed to load app password page after all retries and 2SV checks")
-            return False, None, "APP_PASSWORD_PAGE_TIMEOUT", "App password page failed to load after multiple attempts"
         
         # Add human-like behavior after page load
         add_random_delays()
@@ -3073,6 +2625,16 @@ def generate_app_password(driver, email):
             else:
                 logger.error(f"[STEP] ✗✗✗ CAPTCHA solving failed: {solve_error}")
                 return False, None, "CAPTCHA_DETECTED", f"CAPTCHA detected on app passwords page. 2Captcha solving failed: {solve_error}"
+        
+        # Wait for page to be ready
+        try:
+            WebDriverWait(driver, 10).until(
+                lambda d: d.execute_script("return document.readyState") == "complete"
+            )
+            time.sleep(2)  # Additional wait for dynamic content
+            logger.info("[STEP] App passwords page loaded")
+        except TimeoutException:
+            logger.warning("[STEP] App passwords page load timeout, proceeding anyway...")
         
         max_retries = 3
         initial_timeout = 30
@@ -3605,8 +3167,8 @@ def handler(event, context):
     
     else:
         # Single user mode (backward compatible)
-    email = event.get("email", os.environ.get("GW_EMAIL"))
-    password = event.get("password", os.environ.get("GW_PASSWORD"))
+        email = event.get("email", os.environ.get("GW_EMAIL"))
+        password = event.get("password", os.environ.get("GW_PASSWORD"))
     
     if not email or not password:
         return {
