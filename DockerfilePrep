@@ -1,10 +1,10 @@
 FROM umihico/aws-lambda-selenium-python:latest
 
 # Copy the Prep Lambda handler
-COPY workspace_prep.py ${LAMBDA_TASK_ROOT}/
+COPY prep_handler.py ${LAMBDA_TASK_ROOT}/
 
 # Ensure correct permissions
-RUN chmod 644 ${LAMBDA_TASK_ROOT}/workspace_prep.py
+RUN chmod 644 ${LAMBDA_TASK_ROOT}/prep_handler.py
 
 # Install required Python dependencies
 # Note: The base image already has selenium installed
@@ -22,4 +22,4 @@ ENV SELENIUM_MANAGER=false
 ENV SELENIUM_DISABLE_DRIVER_MANAGER=1
 
 # Set the Lambda handler entrypoint
-CMD ["workspace_prep.handler"]
+CMD ["prep_handler.handler"]
