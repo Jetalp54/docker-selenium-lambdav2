@@ -1,0 +1,12 @@
+FROM umihico/aws-lambda-selenium-python:latest
+
+# Copy the Prep Lambda handler as main.py
+COPY workspace_prep.py ${LAMBDA_TASK_ROOT}/main.py
+
+# Install required Python dependencies
+RUN pip install --no-cache-dir \
+    boto3 \
+    selenium
+
+# Set the Lambda handler entrypoint
+CMD ["main.handler"]
