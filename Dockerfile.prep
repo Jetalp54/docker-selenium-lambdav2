@@ -1,12 +1,24 @@
 FROM umihico/aws-lambda-selenium-python:latest
 
+# Set working directory to Lambda task root
+WORKDIR /var/task
+
 # Copy the Prep Lambda handler
-COPY workspace_prep.py ${LAMBDA_TASK_ROOT}/workspace_prep.py
+COPY workspace_prep.py .
+
+# Ensure correct permissions
+RUN chmod 644 workspace_prep.py
 
 # Install required Python dependencies
 RUN pip install --no-cache-dir \
     boto3 \
     selenium
+
+# Set the Lambda handler entrypoint
+# Set environment variables to disable SeleniumManager at container level
+ENV SE_SELENIUM_MANAGER=false
+ENV SELENIUM_MANAGER=false
+ENV SELENIUM_DISABLE_DRIVER_MANAGER=1
 
 # Set the Lambda handler entrypoint
 CMD ["workspace_prep.handler"]
