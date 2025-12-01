@@ -13,11 +13,34 @@ import time
 import random
 import logging
 import subprocess
+import traceback
 import boto3
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
+
+# Modern User-Agents for rotation
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/121.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:109.0) Gecko/20100101 Firefox/121.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15"
+]
+
+# Common Window Sizes for rotation
+WINDOW_SIZES = [
+    "1920,1080",
+    "1366,768",
+    "1440,900",
+    "1536,864",
+    "1280,800",
+    "1280,720"
+]
 
 # Configure logging
 logger = logging.getLogger()
@@ -39,34 +62,163 @@ def handler(event, context):
 
     return process_workspace_prep(users)
 
+def get_proxy_from_env():
+    """
+    Get proxy configuration from environment variable (Simplified for Prep).
+    Returns: dict with proxy config or None if not set
+    """
+    proxy_url = os.environ.get('PROXY_URL', '').strip()
+    if not proxy_url:
+        return None
+    return {'http': proxy_url, 'https': proxy_url}
+
 def get_chrome_driver():
-    """Initialize Chrome Driver (Headless)"""
+    """
+    Initialize Selenium Chrome driver for AWS Lambda environment.
+    Uses standard Selenium with CDP-based anti-detection (Lambda-compatible).
+    """
+    # Force environment variables to prevent SeleniumManager from trying to write to read-only FS
+    os.environ['HOME'] = '/tmp'
+    os.environ['XDG_CACHE_HOME'] = '/tmp/.cache'
+    os.environ['SELENIUM_MANAGER_CACHE'] = '/tmp/.cache/selenium'
+    os.environ['SE_SELENIUM_MANAGER'] = 'false'
+    os.environ['SELENIUM_MANAGER'] = 'false'
+    os.environ['SELENIUM_DISABLE_DRIVER_MANAGER'] = '1'
+    
+    # Ensure /tmp directories exist
+    os.makedirs('/tmp/.cache/selenium', exist_ok=True)
+    
+    # Locate Chrome binary and ChromeDriver
+    logger.info("[LAMBDA] Checking /opt directory contents...")
+    chrome_binary = None
+    chromedriver_path = None
+    
+    # Common paths for Chrome binary
+    chrome_paths = [
+        '/opt/chrome/chrome',
+        '/opt/chrome/headless-chromium',
+        '/usr/bin/chromium',
+        '/usr/bin/google-chrome',
+    ]
+    
+    for path in chrome_paths:
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            chrome_binary = path
+            logger.info(f"[LAMBDA] Found Chrome binary at: {chrome_binary}")
+            break
+            
+    if not chrome_binary:
+        # Fallback to which
+        try:
+            result = subprocess.run(['which', 'google-chrome'], capture_output=True, text=True)
+            if result.returncode == 0:
+                chrome_binary = result.stdout.strip()
+        except:
+            pass
+
+    if not chrome_binary:
+        logger.error("[LAMBDA] Chrome binary not found!")
+        raise Exception("Chrome binary not found in Lambda environment")
+    
+    # Common paths for ChromeDriver
+    chromedriver_paths = [
+        '/opt/chromedriver',
+        '/usr/bin/chromedriver',
+        '/usr/local/bin/chromedriver',
+    ]
+    
+    for path in chromedriver_paths:
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            chromedriver_path = path
+            logger.info(f"[LAMBDA] Found ChromeDriver at: {chromedriver_path}")
+            break
+            
+    if not chromedriver_path:
+        logger.error("[LAMBDA] ChromeDriver not found!")
+        raise Exception("ChromeDriver not found in Lambda environment")
+
+    # Use Selenium Chrome options with anti-detection
     chrome_options = Options()
-    chrome_options.add_argument("--headless")
+    
+    # Get proxy configuration if enabled
+    proxy_config = get_proxy_from_env()
+    if proxy_config:
+        chrome_options.add_argument(f"--proxy-server={proxy_config['http']}")
+    
+    # Randomize User-Agent
+    user_agent = random.choice(USER_AGENTS)
+    chrome_options.add_argument(f"--user-agent={user_agent}")
+    logger.info(f"[ANTI-DETECT] Using User-Agent: {user_agent}")
+
+    # Randomize Window Size
+    window_size = random.choice(WINDOW_SIZES)
+    chrome_options.add_argument(f"--window-size={window_size}")
+    
+    # Core stability options for Lambda
+    chrome_options.add_argument("--headless=new")
     chrome_options.add_argument("--no-sandbox")
     chrome_options.add_argument("--disable-dev-shm-usage")
     chrome_options.add_argument("--disable-gpu")
-    chrome_options.add_argument("--window-size=1280x1696")
+    chrome_options.add_argument("--lang=en-US")
     chrome_options.add_argument("--single-process")
-    chrome_options.add_argument("--disable-application-cache")
-    chrome_options.add_argument("--disable-infobars")
-    chrome_options.add_argument("--hide-scrollbars")
-    chrome_options.add_argument("--enable-logging")
-    chrome_options.add_argument("--log-level=0")
-    chrome_options.add_argument("--ignore-certificate-errors")
-    chrome_options.add_argument("--homedir=/tmp")
+    chrome_options.add_argument("--disable-background-networking")
+    chrome_options.add_argument("--disable-default-apps")
+    chrome_options.add_argument("--disable-extensions")
+    chrome_options.add_argument("--disable-sync")
+    chrome_options.add_argument("--metrics-recording-only")
+    chrome_options.add_argument("--mute-audio")
+    chrome_options.add_argument("--no-first-run")
+    chrome_options.add_argument("--safebrowsing-disable-auto-update")
+    chrome_options.add_argument("--disable-setuid-sandbox")
+    chrome_options.add_argument("--disable-software-rasterizer")
     
-    # Binary location (from base image)
-    # Try common locations
-    if os.path.exists("/opt/chrome/chrome"):
-        chrome_options.binary_location = "/opt/chrome/chrome"
-    elif os.path.exists("/usr/bin/google-chrome"):
-        chrome_options.binary_location = "/usr/bin/google-chrome"
+    # Anti-detection options
+    chrome_options.add_argument("--disable-blink-features=AutomationControlled")
+    chrome_options.add_experimental_option("excludeSwitches", ["enable-automation", "enable-logging"])
+    chrome_options.add_experimental_option('useAutomationExtension', False)
+    chrome_options.add_experimental_option("prefs", {
+        "profile.default_content_setting_values.notifications": 2,
+        "profile.default_content_settings.popups": 0,
+        "credentials_enable_service": False,
+        "profile.password_manager_enabled": False,
+    })
 
-    service = Service("/usr/bin/chromedriver") # Default for base image
-    
-    driver = webdriver.Chrome(options=chrome_options)
-    return driver
+    try:
+        # Create Service with explicit ChromeDriver path
+        service = Service(executable_path=chromedriver_path)
+        
+        # Set browser executable path in options
+        chrome_options.binary_location = chrome_binary
+        
+        # Set environment variables to disable SeleniumManager
+        os.environ['SE_SELENIUM_MANAGER'] = 'false'
+        os.environ['SELENIUM_MANAGER'] = 'false'
+        os.environ['SELENIUM_DISABLE_DRIVER_MANAGER'] = '1'
+        
+        logger.info(f"[LAMBDA] Initializing Chrome driver with ChromeDriver: {chromedriver_path}, Chrome: {chrome_binary}")
+        
+        driver = webdriver.Chrome(service=service, options=chrome_options)
+        driver.set_page_load_timeout(60)
+        
+        # Inject anti-detection script
+        try:
+            anti_detection_script = '''
+                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+                Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
+                Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
+                Object.defineProperty(navigator, 'platform', {get: () => 'Win32'});
+            '''
+            driver.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument', {
+                'source': anti_detection_script
+            })
+        except Exception as e:
+            logger.warning(f"[LAMBDA] Could not inject anti-detection script: {e}")
+        
+        return driver
+    except Exception as e:
+        logger.error(f"[LAMBDA] Failed to initialize Chrome driver: {e}")
+        logger.error(traceback.format_exc())
+        raise
 
 def install_gcloud():
     """Install gcloud CLI to /tmp if not present"""
