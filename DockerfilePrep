@@ -1,4 +1,3 @@
-
 FROM umihico/aws-lambda-selenium-python:latest
 
 # Set working directory to Lambda task root
