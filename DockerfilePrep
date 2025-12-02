@@ -1,24 +1,97 @@
-FROM umihico/aws-lambda-selenium-python:latest
+FROM public.ecr.aws/lambda/python:3.10
 
-# Set working directory to Lambda task root
-WORKDIR /var/task
+# ------------------------
+# Install system libraries
+# ------------------------
+RUN yum update -y && \
+    yum install -y \
+        unzip \
+        zip \
+        tar \
+        wget \
+        curl \
+        which \
+        xz \
+        gtk3 \
+        atk \
+        at-spi2-atk \
+        cups-libs \
+        dbus-glib \
+        nss \
+        GConf2 \
+        alsa-lib \
+        libXcomposite \
+        libXcursor \
+        libXdamage \
+        libXext \
+        libXi \
+        libXrandr \
+        libXScrnSaver \
+        libXtst \
+        pango \
+        libcairo \
+        libX11 \
+        libXrender \
+        libXfixes \
+        libxshmfence \
+        mesa-libgbm \
+        mesa-libglu \
+        libdrm \
+        libuuid \
+        ipa-gothic-fonts
 
-# Copy the Prep Lambda handler
-COPY workspace_prep.py .
+# ------------------------
+# Install Google Chrome (stable)
+# ------------------------
+RUN curl https://dl.google.com/linux/direct/google-chrome-stable_current_x86_64.rpm -o /tmp/chrome.rpm && \
+    yum install -y /tmp/chrome.rpm && \
+    rm /tmp/chrome.rpm
 
-# Ensure correct permissions
-RUN chmod 644 workspace_prep.py
+# ------------------------
+# Install ChromeDriver (matching version)
+# ------------------------
+RUN CHROME_VERSION=$(google-chrome --version | grep -oE "[0-9.]+" | head -1 | cut -d "." -f 1) && \
+    DRIVER_VERSION=$(curl -s "https://googlechromelabs.github.io/chrome-for-testing/LATEST_RELEASE_${CHROME_VERSION}") && \
+    echo "Using ChromeDriver version: $DRIVER_VERSION" && \
+    curl -L "https://storage.googleapis.com/chrome-for-testing-public/${DRIVER_VERSION}/linux64/chromedriver-linux64.zip" -o /tmp/chromedriver.zip && \
+    unzip /tmp/chromedriver.zip -d /tmp/ && \
+    mv /tmp/chromedriver-linux64/chromedriver /usr/bin/chromedriver && \
+    chmod +x /usr/bin/chromedriver && \
+    rm -rf /tmp/chromedriver.zip /tmp/chromedriver-linux64
 
-# Install required Python dependencies
+# ------------------------
+# Install Google Cloud SDK
+# ------------------------
+RUN curl -o /tmp/gcloud.tar.gz https://dl.google.com/dl/cloudsdk/channels/rapid/downloads/google-cloud-cli-linux-x86_64.tar.gz && \
+    tar -xf /tmp/gcloud.tar.gz -C /opt && \
+    /opt/google-cloud-sdk/install.sh --quiet && \
+    ln -s /opt/google-cloud-sdk/bin/gcloud /usr/bin/gcloud && \
+    rm /tmp/gcloud.tar.gz
+
+# ------------------------
+# Install AWS CLI v2
+# ------------------------
+RUN curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "/tmp/awscliv2.zip" && \
+    unzip /tmp/awscliv2.zip -d /tmp && \
+    /tmp/aws/install && \
+    rm -rf /tmp/aws /tmp/awscliv2.zip
+
+# ------------------------
+# Python dependencies
+# ------------------------
 RUN pip install --no-cache-dir \
-    boto3 \
-    selenium
+        boto3 \
+        selenium \
+        undetected-chromedriver \
+        google-auth \
+        google-auth-oauthlib
 
-# Set the Lambda handler entrypoint
-# Set environment variables to disable SeleniumManager at container level
-ENV SE_SELENIUM_MANAGER=false
-ENV SELENIUM_MANAGER=false
-ENV SELENIUM_DISABLE_DRIVER_MANAGER=1
+# ------------------------
+# Copy Lambda app
+# ------------------------
+COPY workspace_prep.py ${LAMBDA_TASK_ROOT}/workspace_prep.py
 
-# Set the Lambda handler entrypoint
+# ------------------------
+# Set Lambda handler
+# ------------------------
 CMD ["workspace_prep.handler"]
